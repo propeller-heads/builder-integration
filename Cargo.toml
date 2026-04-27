@@ -1,0 +1,70 @@
+[workspace]
+members = ["crates/builder-types", "crates/backrunner"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Ethereum primitives
+alloy = { version = "1", features = ["serde"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+thiserror = "1"
+num-bigint = "0.4"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Tycho market data
+tycho-simulation = ">=0.254.0"
+
+# Fynd route solver
+fynd-core = "0.46"
+
+# Internal crates
+builder-types = { path = "crates/builder-types" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Panic prevention
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+# No cheating
+allow_attributes = "deny"
+# Code hygiene
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Safety
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+# Pedantic relaxations
+module_name_repetitions = "allow"
+similar_names = "allow"
+struct_field_names = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

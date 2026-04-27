@@ -1,0 +1,25 @@
+[package]
+name = "backrunner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Block-builder backrun engine: embeddable lib or standalone process"
+
+# Both targets share the same package — block builders import the lib; the binary
+# runs as a standalone process (future: external MQ integration).
+
+[dependencies]
+builder-types = { workspace = true }
+fynd-core = { workspace = true }
+tycho-simulation = { workspace = true }
+alloy = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+
+[lints]
+workspace = true

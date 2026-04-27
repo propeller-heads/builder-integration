@@ -1,0 +1,14 @@
+[package]
+name = "builder-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared channel types for block-builder ↔ backrunner integration"
+
+[dependencies]
+alloy = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+
+[lints]
+workspace = true
