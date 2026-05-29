@@ -30,11 +30,24 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
 
-# Tycho market data
-tycho-simulation = ">=0.254.0"
+# Tycho market data (minimum version required by the fynd branch)
+tycho-simulation = ">=0.302.0"
 
-# Fynd route solver
-fynd-core = "0.46"
+# Fynd route solver — git dep on the feat/build-with-pending branch (PR #207)
+# Switch to a published version once the PR is merged.
+fynd-core = { git = "ssh://git@github.com/propeller-heads/fynd.git", branch = "feat/build-with-pending" }
+
+# HTTP client for 1inch Fusion API
+reqwest = { version = "0.12", features = ["json"] }
+
+# Timestamp parsing for Fusion auction dates
+chrono = "0.4"
+
+# Address hex decoding
+hex = "0.4"
+
+# JSON serialization (for Fusion API responses)
+serde_json = "1"
 
 # Internal crates
 builder-types = { path = "crates/builder-types" }

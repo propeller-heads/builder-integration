@@ -1681,8 +1681,14 @@ dependencies = [
  "alloy",
  "anyhow",
  "builder-types",
+ "chrono",
  "clap",
  "fynd-core",
+ "hex",
+ "num-bigint",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -2915,9 +2921,8 @@ checksum = "42012b0f064e01aa58b545fe3727f90f7dd4020f4a3ea735b50344965f5a57e9"
 
 [[package]]
 name = "fynd-core"
-version = "0.46.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac4d8eda3e85cec682fcb7189beddadaa9bed60ab1f0ecaaea6549a47f437f06"
+version = "0.62.0"
+source = "git+ssh://git@github.com/propeller-heads/fynd.git?branch=feat%2Fbuild-with-pending#0d85221564940aee4f1deda3c8310589373dd170"
 dependencies = [
  "alloy",
  "async-channel",
@@ -2928,6 +2933,7 @@ dependencies = [
  "lazy_static",
  "metrics",
  "num-bigint",
+ "num-rational",
  "num-traits",
  "num_cpus",
  "petgraph",
@@ -6235,7 +6241,6 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
- "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -6666,9 +6671,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-client"
-version = "0.158.0"
+version = "0.302.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18a34452cea1b63662de4149ab15ebd63e0814dc943ef27275da2f80edc53f16"
+checksum = "c5817fb661c6babfa5fa969ac38beb8a5724e310ab4b2be63e26061b93ba6d7e"
 dependencies = [
  "async-trait",
  "backoff",
@@ -6696,9 +6701,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-common"
-version = "0.158.0"
+version = "0.302.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8490bfcd1c547cc797fa97ae28c067ad82a972a822f9dc8ec20c31e0a85dc4b2"
+checksum = "7ef62d9f916904fdbe1ad584fbf67f362146c770b89d0492cd8a556d8c21f0b6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6723,9 +6728,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-ethereum"
-version = "0.158.0"
+version = "0.302.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c84083e89bfdde1c73827fa8bef0b4797f80448a5f0d5c871c96f9f5dba8d5dc"
+checksum = "6336e7003a8d38ed0a8264092763e497ee904ce0e36570b05c9f67799b83e567"
 dependencies = [
  "alloy",
  "async-trait",
@@ -6745,9 +6750,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-execution"
-version = "0.177.1"
+version = "0.302.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9c37560d4f573184ac1fc3dab71cf46bab2f2ea3cea1d57ace0d1e34cd62d46"
+checksum = "8c79cbdd3f339697d04e4c9e10cd9505e626cb79d0cbb31d4876d5ba422c47d1"
 dependencies = [
  "alloy",
  "chrono",
@@ -6766,9 +6771,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-simulation"
-version = "0.258.0"
+version = "0.302.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbb7576a7147305f8478b3a116828ba0444922a811c124a3cd574b89f5b3554f"
+checksum = "31042c99d139407fc899bc9cb5bde277623bbb77b9ada53f832773b55771baeb"
 dependencies = [
  "alloy",
  "alloy-chains",
@@ -6784,7 +6789,7 @@ dependencies = [
  "hex",
  "hex-literal",
  "http 1.4.0",
- "itertools 0.10.5",
+ "itertools 0.13.0",
  "num-bigint",
  "num-traits",
  "prost 0.13.5",
@@ -6794,7 +6799,6 @@ dependencies = [
  "ruint",
  "serde",
  "serde_json",
- "strum 0.25.0",
  "strum_macros 0.25.3",
  "thiserror 1.0.69",
  "tokio",
