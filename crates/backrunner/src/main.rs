@@ -40,6 +40,9 @@ struct Cli {
 
     #[arg(long, env = "CHAIN", default_value = "ethereum")]
     chain: String,
+
+    #[arg(long, env = "CHAIN_ID", default_value_t = 1)]
+    chain_id: u64,
 }
 
 #[tokio::main]
@@ -58,7 +61,8 @@ async fn main() -> Result<()> {
         protocols: cli.protocols,
         min_tvl: cli.min_tvl,
         wallet_address: cli.wallet_address,
-        ready_timeout: Duration::from_secs(180),
+        ready_timeout: Duration::from_mins(3),
+        chain_id: cli.chain_id,
     };
 
     tracing::info!("building backrunner, waiting for market data...");
