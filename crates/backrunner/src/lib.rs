@@ -28,12 +28,13 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use builder_types::{BackrunCandidate, BlockEnv, BuildEvent, ExecutedTx, PostState};
 use client::OneinchClient;
 use fynd_core::{
-    FyndBuilder, Order, OrderSide, PendingBlockProcessor, PendingError, QuoteOptions,
-    QuoteRequest, Solver, SolveError, SolverBuildError,
+    feed::market_data::MarketData, FyndBuilder, MarketEvent, Order, OrderSide,
+    PendingBlockProcessor, PendingError, QuoteOptions, QuoteRequest, Solver, SolveError,
+    SolverBuildError,
 };
 use num_bigint::BigUint;
 use order::{amount_at_timestamp, is_gtc_order, FusionOrder};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, warn};
 use tycho_simulation::tycho_client::feed::BlockHeader;
 use tycho_simulation::tycho_common::{
@@ -135,6 +136,34 @@ impl Backrunner {
         tokio::spawn(run_orderbook(Arc::new(oneinch), orders_tx));
 
         Ok(Self { solver, pending: tokio::sync::Mutex::new(pending), orders_rx })
+    }
+
+    /// Returns the number of live Fusion orders currently held by the orderbook poller.
+    ///
+    /// Zero until the first poll completes (~12 s after `build()`).
+    pub fn active_order_count(&self) -> usize {
+        self.orders_rx.borrow().len()
+    }
+
+    /// Subscribes to market update events — one `MarketUpdated` per Ethereum block.
+    ///
+    /// Must be called before [`Backrunner::run`] since that method moves `self`.
+    pub fn subscribe_market_events(&self) -> broadcast::Receiver<MarketEvent> {
+        self.solver.subscribe_market_events()
+    }
+
+    /// Returns the current confirmed block number, or `None` before the first block arrives.
+    pub fn current_block_number(&self) -> Option<u64> {
+        let md = self.solver.market_data();
+        let view = md.try_read_blocking()?;
+        view.state_label()?.parse().ok()
+    }
+
+    /// Returns a handle to the underlying market data store.
+    ///
+    /// Must be called before [`Backrunner::run`] since that method moves `self`.
+    pub fn market_data(&self) -> MarketData {
+        self.solver.market_data()
     }
 
     /// Runs the backrun event loop until `events` is closed.
