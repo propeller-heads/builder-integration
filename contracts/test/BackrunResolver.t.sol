@@ -261,6 +261,7 @@ contract BackrunResolverTest is Test {
 
         Order memory o = _makeOrder(USDC);
 
+        uint256 usdcBefore = IERC20(USDC).balanceOf(address(resolver));
         uint256 ethBefore = miner.balance;
 
         vm.prank(LOP);
@@ -275,9 +276,9 @@ contract BackrunResolverTest is Test {
             extra
         );
 
-        // Core invariant: resolver holds at least takingAmount USDC.
-        uint256 usdcBal = IERC20(USDC).balanceOf(address(resolver));
-        assertGe(usdcBal, takingAmount, "USDC balance below takingAmount");
+        // Assert the primary swap actually delivered at least takingAmount USDC.
+        uint256 usdcReceived = IERC20(USDC).balanceOf(address(resolver)) - usdcBefore;
+        assertGe(usdcReceived, takingAmount, "primary swap did not return enough USDC");
         // Surplus path is best-effort; log the coinbase result.
         emit log_named_uint("coinbase ETH gained", miner.balance - ethBefore);
     }
