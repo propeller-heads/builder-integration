@@ -28,7 +28,7 @@ struct Cli {
         long,
         env = "PROTOCOLS",
         value_delimiter = ',',
-        default_values = ["uniswap_v2_ethereum", "uniswap_v3_ethereum"]
+        default_values = ["uniswap_v2", "uniswap_v3"]
     )]
     protocols: Vec<String>,
 

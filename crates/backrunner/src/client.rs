@@ -166,17 +166,11 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
     let from_decimals = item
         .from_token_decimals
         .or_else(|| known_decimals(&from_addr))
-        .unwrap_or_else(|| {
-            tracing::warn!(token = %from_addr, "unknown decimals, defaulting to 18");
-            18
-        });
+        .unwrap_or(18);
     let to_decimals = item
         .to_token_decimals
         .or_else(|| known_decimals(&to_addr))
-        .unwrap_or_else(|| {
-            tracing::warn!(token = %to_addr, "unknown decimals, defaulting to 18");
-            18
-        });
+        .unwrap_or(18);
 
     Ok(FusionOrder {
         order_id: item.order_hash,

@@ -9,16 +9,12 @@
 //!   `TYCHO_API_KEY`  — (optional) Tycho API key
 //!   `CHAIN_ID`       — (optional, default 1) 1inch Fusion chain ID
 
-use std::{
-    collections::HashMap,
-    env,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, env, time::Duration};
 
 use anyhow::{Context, Result};
 use backrunner::{Backrunner, BackrunnerConfig};
 use builder_types::{BackrunCandidate, BlockEnv, BuildEvent, PostState};
-use fynd_core::{feed::market_data::MarketData, MarketEvent};
+use fynd_core::{feed::market_data::MarketData, BlockInfo, MarketEvent};
 use tokio::sync::{broadcast, mpsc, watch};
 use uuid::Uuid;
 
@@ -47,10 +43,7 @@ async fn main() -> Result<()> {
         tycho_url,
         rpc_url,
         tycho_api_key,
-        protocols: vec![
-            "uniswap_v2_ethereum".to_owned(),
-            "uniswap_v3_ethereum".to_owned(),
-        ],
+        protocols: vec!["uniswap_v2".to_owned(), "uniswap_v3".to_owned()],
         min_tvl: 100.0,
         wallet_address: "0x0000000000000000000000000000000000000000".to_owned(),
         ready_timeout: Duration::from_mins(READY_TIMEOUT_MINS),
@@ -105,22 +98,19 @@ async fn run_block_loop(
 
         let MarketEvent::MarketUpdated { .. } = event;
 
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-
-        let Some(confirmed_block) = read_confirmed_block(&market_data) else {
+        let Some(confirmed) = read_confirmed_block_info(&market_data) else {
             tracing::debug!("confirmed block not yet in market data; skipping");
             continue;
         };
-
-        let block_number = confirmed_block + 1;
+        let block_number = confirmed.number() + 1;
+        // Use confirmed block timestamp + 12s as the approximate next block timestamp.
+        let block_timestamp = confirmed.timestamp() + 12;
         tracing::info!(block_number, "new block — issuing iteration");
 
         let uuid = Uuid::new_v4();
         let block_env = BlockEnv {
             block_number,
-            block_timestamp: now_secs,
+            block_timestamp,
             base_fee_per_gas: 0,
         };
 
@@ -152,10 +142,8 @@ async fn run_block_loop(
     }
 }
 
-/// Reads the confirmed block number from the market data state label.
-///
-/// Returns `None` before the first block update has been applied.
-fn read_confirmed_block(market_data: &MarketData) -> Option<u64> {
+/// Returns the block info for the last confirmed block, or `None` if not yet available.
+fn read_confirmed_block_info(market_data: &MarketData) -> Option<BlockInfo> {
     let view = market_data.try_read_blocking()?;
-    view.state_label()?.parse().ok()
+    view.last_updated().cloned()
 }

@@ -38,7 +38,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, warn};
 use tycho_simulation::tycho_client::feed::BlockHeader;
 use tycho_simulation::tycho_common::{
-    models::blockchain::{LogInput, TxInput},
+    models::{blockchain::{LogInput, TxInput}, token::Token, Address},
     Bytes as TychoBytes,
 };
 use uuid::Uuid;
@@ -133,7 +133,8 @@ impl Backrunner {
         // will populate it on the first poll (within 12 seconds).
         let (orders_tx, orders_rx) = watch::channel(Arc::new(Vec::new()));
 
-        tokio::spawn(run_orderbook(Arc::new(oneinch), orders_tx));
+        let market_data_for_orders = solver.market_data();
+        tokio::spawn(run_orderbook(Arc::new(oneinch), orders_tx, market_data_for_orders));
 
         Ok(Self { solver, pending: tokio::sync::Mutex::new(pending), orders_rx })
     }
@@ -156,7 +157,7 @@ impl Backrunner {
     pub fn current_block_number(&self) -> Option<u64> {
         let md = self.solver.market_data();
         let view = md.try_read_blocking()?;
-        view.state_label()?.parse().ok()
+        Some(view.last_updated()?.number())
     }
 
     /// Returns a handle to the underlying market data store.
@@ -184,9 +185,13 @@ impl Backrunner {
 }
 
 /// Background task: polls 1inch Fusion for active orders every 12 seconds.
+///
+/// After each fetch, token decimals are patched from Tycho's registry (which has exact
+/// on-chain values for every indexed token) to fix any fallback-18 from the 1inch API.
 async fn run_orderbook(
     client: Arc<OneinchClient>,
     orders_tx: watch::Sender<Arc<Vec<FusionOrder>>>,
+    market_data: MarketData,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(12));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -195,8 +200,11 @@ async fn run_orderbook(
         interval.tick().await;
         match client.fetch_active_orders().await {
             Ok(orders) => {
-                let filtered: Vec<FusionOrder> =
+                let mut filtered: Vec<FusionOrder> =
                     orders.into_iter().filter(|o| !is_gtc_order(o)).collect();
+                if let Some(view) = market_data.try_read_blocking() {
+                    patch_decimals_from_registry(&mut filtered, view.token_registry_ref());
+                }
                 debug!(order_count = filtered.len(), "orderbook refreshed");
                 if orders_tx.send(Arc::new(filtered)).is_err() {
                     break;
@@ -204,6 +212,22 @@ async fn run_orderbook(
             }
             Err(e) => {
                 warn!(error = %e, "failed to fetch active orders; retrying next tick");
+            }
+        }
+    }
+}
+
+/// Overwrites decimal fields on orders whose token addresses appear in the Tycho registry.
+fn patch_decimals_from_registry(orders: &mut Vec<FusionOrder>, registry: &HashMap<Address, Token>) {
+    for order in orders {
+        if let Ok(addr) = parse_address(&order.from_token) {
+            if let Some(token) = registry.get(&addr) {
+                order.from_token_decimals = u8::try_from(token.decimals).unwrap_or(18);
+            }
+        }
+        if let Ok(addr) = parse_address(&order.to_token) {
+            if let Some(token) = registry.get(&addr) {
+                order.to_token_decimals = u8::try_from(token.decimals).unwrap_or(18);
             }
         }
     }
