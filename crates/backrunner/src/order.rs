@@ -39,6 +39,18 @@ pub struct FusionOrder {
     pub from_token_usd_rate: f64,
     /// USD value of one whole `to_token` at order creation.
     pub to_token_usd_rate: f64,
+    /// EIP-712 maker signature (65 bytes, `0x`-prefixed hex).
+    pub signature: String,
+    /// Fusion Dutch-auction extension bytes (`0x`-prefixed hex, may be `"0x"` if empty).
+    pub extension: String,
+    /// Order salt (matches the on-chain order's `salt` field).
+    pub salt: String,
+    /// Maker EOA address (`0x`-prefixed hex).
+    pub maker_address: String,
+    /// Receiver address (`0x`-prefixed hex).
+    pub receiver_address: String,
+    /// Encoded maker traits as decimal string.
+    pub maker_traits: String,
 }
 
 /// Returns true for GTC (Good Till Cancelled) limit orders that carry no Dutch auction premium.
@@ -119,6 +131,12 @@ mod tests {
             to_token_decimals: 18,
             from_token_usd_rate: 1.0,
             to_token_usd_rate: 1.0,
+            signature: "0x00".to_string(),
+            extension: "0x".to_string(),
+            salt: "0".to_string(),
+            maker_address: "0x0000000000000000000000000000000000000000".to_string(),
+            receiver_address: "0x0000000000000000000000000000000000000000".to_string(),
+            maker_traits: "0".to_string(),
         }
     }
 

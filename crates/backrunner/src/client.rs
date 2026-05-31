@@ -63,6 +63,10 @@ struct ActiveOrderItem {
     from_token_decimals: Option<u8>,
     #[serde(default)]
     to_token_decimals: Option<u8>,
+    #[serde(default)]
+    signature: String,
+    #[serde(default)]
+    extension: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +76,14 @@ struct OrderFields {
     taker_asset: String,
     making_amount: String,
     taking_amount: String,
+    #[serde(default)]
+    salt: String,
+    #[serde(default)]
+    maker: String,
+    #[serde(default)]
+    receiver: String,
+    #[serde(default)]
+    maker_traits: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +200,12 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
         to_token_decimals: to_decimals,
         from_token_usd_rate: item.from_token_to_usdc_rate.unwrap_or(0.0),
         to_token_usd_rate: item.to_token_to_usdc_rate.unwrap_or(0.0),
+        signature: item.signature,
+        extension: item.extension,
+        salt: item.order.salt,
+        maker_address: item.order.maker,
+        receiver_address: item.order.receiver,
+        maker_traits: item.order.maker_traits,
     })
 }
 
