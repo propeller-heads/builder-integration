@@ -128,7 +128,7 @@ impl Backrunner {
             config.protocols,
             config.min_tvl,
         )
-        .algorithm("most_liquid");
+        .algorithm("bellman_ford");
 
         let builder = match config.tycho_api_key {
             Some(key) => builder.tycho_api_key(key),
