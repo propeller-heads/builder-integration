@@ -3,17 +3,28 @@
 //! Subscribes to Fynd market events (one per Ethereum block) and issues one synthetic
 //! builder iteration per block, exercising the complete pipeline on every block.
 //!
+//! For each fill candidate, `eth_call` is issued with a state override that injects
+//! the `BackrunResolver` bytecode at the resolver address.  This means a live
+//! deployment is **not required** — set `RESOLVER_ADDRESS` to any address you want
+//! to call from (default: a fixed virtual address).  The bytecode used is the one
+//! compiled into this binary; regenerate it after contract changes with:
+//!
+//!   forge script contracts/script/PrintBytecode.s.sol --silent
+//!   cp contracts/out/BackrunResolver.runtime.hex \
+//!      crates/backrunner/bytecode/BackrunResolver.runtime.hex
+//!
 //! Required env vars:
 //!   `TYCHO_URL`         — Tycho WebSocket host
-//!   `ETH_RPC_URL`       — Ethereum JSON-RPC endpoint (used by the backrunner internally)
+//!   `ETH_RPC_URL`       — Ethereum JSON-RPC endpoint
 //!   `TYCHO_API_KEY`     — (optional) Tycho API key
 //!   `CHAIN_ID`          — (optional, default 1) 1inch Fusion chain ID
-//!   `RESOLVER_ADDRESS`  — (optional, default `address(0)`) Address to call from in `eth_call`
+//!   `RESOLVER_ADDRESS`  — (optional) override the virtual resolver address
 
 use std::{collections::HashMap, env, time::Duration};
 
-use alloy::primitives::Address as AlloyAddress;
+use alloy::primitives::{address, Address as AlloyAddress, Bytes as AlloyBytes};
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::types::state::AccountOverride;
 use anyhow::{Context, Result};
 use backrunner::{Backrunner, BackrunnerConfig};
 use builder_types::{BackrunCandidate, BlockEnv, BuildEvent, PostState};
@@ -23,6 +34,22 @@ use uuid::Uuid;
 
 const READY_TIMEOUT_MINS: u64 = 10;
 const ORDERBOOK_WAIT_SECS: u64 = 15;
+
+/// Fynd/Tycho router on Ethereum mainnet.
+const FYND_ROUTER: AlloyAddress = address!("1f8dB310f32D48B6180fF902EC60C586128cEf47");
+
+/// Synthetic address used when no `RESOLVER_ADDRESS` is set.
+/// The bytecode override makes deployment unnecessary.
+const VIRTUAL_RESOLVER: AlloyAddress = address!("0000000000000000000000000000000000001234");
+
+/// `BackrunResolver` runtime bytecode compiled from `contracts/src/BackrunResolver.sol`.
+/// Injected via state override on every `eth_call`, so no on-chain deployment is needed.
+///
+/// Regenerate after contract changes:
+///   `forge script contracts/script/PrintBytecode.s.sol --silent`
+///   `cp contracts/out/BackrunResolver.runtime.hex crates/backrunner/bytecode/BackrunResolver.runtime.hex`
+const RESOLVER_BYTECODE_HEX: &str =
+    include_str!("../../bytecode/BackrunResolver.runtime.hex");
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,9 +68,18 @@ async fn main() -> Result<()> {
         .connect_http(rpc_url.parse().context("invalid ETH_RPC_URL")?);
 
     let resolver_addr: AlloyAddress = env::var("RESOLVER_ADDRESS")
-        .unwrap_or_else(|_| "0x0000000000000000000000000000000000000000".to_string())
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|a: &AlloyAddress| !a.is_zero())
+        .unwrap_or(VIRTUAL_RESOLVER);
+
+    let resolver_bytecode: AlloyBytes = RESOLVER_BYTECODE_HEX
+        .trim()
         .parse()
-        .unwrap_or_default();
+        .context("embedded resolver bytecode is not valid hex")?;
+
+    tracing::info!(%resolver_addr, bytecode_bytes = resolver_bytecode.len(), "resolver ready (bytecode override)");
+
     let chain_id: u64 = env::var("CHAIN_ID")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -59,8 +95,8 @@ async fn main() -> Result<()> {
         wallet_address: "0x0000000000000000000000000000000000000000".to_owned(),
         ready_timeout: Duration::from_mins(READY_TIMEOUT_MINS),
         chain_id,
-        resolver_address: AlloyAddress::ZERO,
-        fynd_router: AlloyAddress::ZERO,
+        resolver_address: resolver_addr,
+        fynd_router: FYND_ROUTER,
         slippage: 0.005,
     };
 
@@ -88,7 +124,16 @@ async fn main() -> Result<()> {
     tokio::spawn(backrunner.run(event_rx, candidate_tx));
 
     tracing::info!("entering block loop...");
-    run_block_loop(&mut market_rx, market_data, event_tx, &mut candidate_rx, provider, resolver_addr).await
+    run_block_loop(
+        &mut market_rx,
+        market_data,
+        event_tx,
+        &mut candidate_rx,
+        provider,
+        resolver_addr,
+        resolver_bytecode,
+    )
+    .await
 }
 
 async fn run_block_loop(
@@ -98,6 +143,7 @@ async fn run_block_loop(
     candidate_rx: &mut watch::Receiver<Option<BackrunCandidate>>,
     provider: impl Provider + Clone + 'static,
     resolver_addr: AlloyAddress,
+    resolver_bytecode: AlloyBytes,
 ) -> Result<()> {
     loop {
         let event = match market_rx.recv().await {
@@ -119,7 +165,6 @@ async fn run_block_loop(
             continue;
         };
         let block_number = confirmed.number() + 1;
-        // Use confirmed block timestamp + 12s as the approximate next block timestamp.
         let block_timestamp = confirmed.timestamp() + 12;
         tracing::info!(block_number, "new block — issuing iteration");
 
@@ -165,7 +210,7 @@ async fn run_block_loop(
                 tracing::info!(
                     block_number,
                     txs = c.txs.len(),
-                    "candidate found — validating via eth_call"
+                    "candidate found — validating via eth_call with bytecode override"
                 );
                 for (i, backrun_tx) in c.txs.iter().enumerate() {
                     let tx_req = alloy::rpc::types::TransactionRequest::default()
@@ -174,7 +219,18 @@ async fn run_block_loop(
                         .value(backrun_tx.tx.value)
                         .input(backrun_tx.tx.data.clone().into());
 
-                    match provider.call(tx_req).await {
+                    let result = provider
+                        .call(tx_req)
+                        .account_override(
+                            resolver_addr,
+                            AccountOverride {
+                                code: Some(resolver_bytecode.clone()),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+
+                    match result {
                         Ok(output) => {
                             tracing::info!(
                                 block_number,
