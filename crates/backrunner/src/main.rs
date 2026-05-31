@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use alloy::primitives::Address as AlloyAddress;
 use anyhow::{Context, Result};
 use backrunner::{Backrunner, BackrunnerConfig};
 use builder_types::{BackrunCandidate, BuildEvent};
@@ -43,6 +44,21 @@ struct Cli {
 
     #[arg(long, env = "CHAIN_ID", default_value_t = 1)]
     chain_id: u64,
+
+    #[arg(
+        long, env = "RESOLVER_ADDRESS",
+        default_value = "0x0000000000000000000000000000000000000000"
+    )]
+    resolver_address: AlloyAddress,
+
+    #[arg(
+        long, env = "FYND_ROUTER",
+        default_value = "0x1f8dB310f32D48B6180fF902EC60C586128cEf47"
+    )]
+    fynd_router: AlloyAddress,
+
+    #[arg(long, env = "SLIPPAGE", default_value_t = 0.005)]
+    slippage: f64,
 }
 
 #[tokio::main]
@@ -63,6 +79,9 @@ async fn main() -> Result<()> {
         wallet_address: cli.wallet_address,
         ready_timeout: Duration::from_mins(3),
         chain_id: cli.chain_id,
+        resolver_address: cli.resolver_address,
+        fynd_router: cli.fynd_router,
+        slippage: cli.slippage,
     };
 
     tracing::info!("building backrunner, waiting for market data...");

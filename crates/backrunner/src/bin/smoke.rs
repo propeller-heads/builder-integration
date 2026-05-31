@@ -11,6 +11,7 @@
 
 use std::{collections::HashMap, env, time::Duration};
 
+use alloy::primitives::Address as AlloyAddress;
 use anyhow::{Context, Result};
 use backrunner::{Backrunner, BackrunnerConfig};
 use builder_types::{BackrunCandidate, BlockEnv, BuildEvent, PostState};
@@ -48,6 +49,9 @@ async fn main() -> Result<()> {
         wallet_address: "0x0000000000000000000000000000000000000000".to_owned(),
         ready_timeout: Duration::from_mins(READY_TIMEOUT_MINS),
         chain_id,
+        resolver_address: AlloyAddress::ZERO,
+        fynd_router: AlloyAddress::ZERO,
+        slippage: 0.005,
     };
 
     tracing::info!("building backrunner (up to {READY_TIMEOUT_MINS} min)...");

@@ -20,10 +20,13 @@
 //! event_tx.send(BuildEvent::IterationStart { uuid, block }).await?;
 //! ```
 
+pub mod abi;
 mod client;
 mod order;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
+
+use alloy::primitives::Address as AlloyAddress;
 
 use builder_types::{BackrunCandidate, BlockEnv, BuildEvent, ExecutedTx, PostState};
 use client::OneinchClient;
@@ -64,6 +67,12 @@ pub struct BackrunnerConfig {
     pub ready_timeout: Duration,
     /// 1inch Fusion chain ID (1 = Ethereum mainnet).
     pub chain_id: u64,
+    /// Address of the deployed `BackrunResolver` contract.
+    pub resolver_address: AlloyAddress,
+    /// Slippage tolerance for Fynd quotes (0.005 = 0.5%).
+    pub slippage: f64,
+    /// Fynd/Tycho router address passed in resolver extraData.
+    pub fynd_router: AlloyAddress,
 }
 
 /// Error returned by [`Backrunner::build`].
@@ -98,6 +107,12 @@ pub struct Backrunner {
     pending: tokio::sync::Mutex<PendingBlockProcessor>,
     /// Receiver for the current set of live Fusion orders (refreshed ~every 12s).
     orders_rx: watch::Receiver<Arc<Vec<FusionOrder>>>,
+    #[expect(dead_code, reason = "read in Task 3 when building BackrunCandidate calldata")]
+    pub(crate) resolver_address: AlloyAddress,
+    #[expect(dead_code, reason = "read in Task 3 when building BackrunCandidate calldata")]
+    pub(crate) fynd_router: AlloyAddress,
+    #[expect(dead_code, reason = "read in Task 3 for Fynd quote slippage")]
+    pub(crate) slippage: f64,
 }
 
 impl Backrunner {
@@ -136,7 +151,14 @@ impl Backrunner {
         let market_data_for_orders = solver.market_data();
         tokio::spawn(run_orderbook(Arc::new(oneinch), orders_tx, market_data_for_orders));
 
-        Ok(Self { solver, pending: tokio::sync::Mutex::new(pending), orders_rx })
+        Ok(Self {
+            solver,
+            pending: tokio::sync::Mutex::new(pending),
+            orders_rx,
+            resolver_address: config.resolver_address,
+            fynd_router: config.fynd_router,
+            slippage: config.slippage,
+        })
     }
 
     /// Returns the number of live Fusion orders currently held by the orderbook poller.
