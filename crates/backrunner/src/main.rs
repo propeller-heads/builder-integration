@@ -32,7 +32,7 @@ struct Cli {
         default_values = [
             "uniswap_v2", "uniswap_v3", "uniswap_v4",
             "sushiswap_v2", "pancakeswap_v2", "pancakeswap_v3",
-            "vm:curve", "vm:maverick_v2", "fluid_v1",
+            "vm:maverick_v2", "fluid_v1",
         ]
     )]
     protocols: Vec<String>,

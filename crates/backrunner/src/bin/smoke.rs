@@ -111,7 +111,6 @@ async fn main() -> Result<()> {
             "sushiswap_v2".to_owned(),
             "pancakeswap_v2".to_owned(),
             "pancakeswap_v3".to_owned(),
-            "vm:curve".to_owned(),
             "vm:maverick_v2".to_owned(),
             "fluid_v1".to_owned(),
         ],
