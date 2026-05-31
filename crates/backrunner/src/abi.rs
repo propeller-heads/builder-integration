@@ -74,13 +74,12 @@ pub struct SettleParams<'a> {
     pub extension: &'a [u8],
     /// Auction price at this block timestamp (price threshold, bits 0-79).
     pub taking_amount: u128,
-    /// Fynd/Tycho router address.
-    pub fynd_router: Address,
+    /// Fynd/Tycho router address (used for both primary swap and surplus→WETH swap).
+    pub router: Address,
     /// Fynd swap calldata with `receiver = resolver_address`.
     pub primary_swap_calldata: &'a [u8],
-    /// Router for surplus→WETH swap (`Address::ZERO` to skip).
-    pub surplus_router: Address,
-    /// Template calldata; `amountIn` patched on-chain at runtime.
+    /// Surplus→WETH template calldata; `amountIn` patched on-chain at runtime.
+    /// Empty slice means no surplus swap.
     pub surplus_calldata: &'a [u8],
     /// The deployed `BackrunResolver` contract address.
     pub resolver_address: Address,
@@ -90,11 +89,10 @@ pub struct SettleParams<'a> {
 #[must_use]
 pub fn build_settle_calldata(p: &SettleParams<'_>) -> Bytes {
     // ── extraData for takerInteraction ──────────────────────────────────────
-    // abi.encode(fyndRouter, swapCalldata, surplusRouter, surplusCalldata)
+    // abi.encode(router, swapCalldata, surplusCalldata)
     let extra_data: Vec<u8> = (
-        p.fynd_router,
+        p.router,
         Bytes::copy_from_slice(p.primary_swap_calldata),
-        p.surplus_router,
         Bytes::copy_from_slice(p.surplus_calldata),
     )
         .abi_encode();
@@ -166,9 +164,8 @@ mod tests {
             signature: &[0u8; 65],
             extension: &[],
             taking_amount: 999_u128,
-            fynd_router: Address::ZERO,
+            router: Address::ZERO,
             primary_swap_calldata: &[0xde, 0xad],
-            surplus_router: Address::ZERO,
             surplus_calldata: &[],
             resolver_address: Address::ZERO,
         };
@@ -190,9 +187,8 @@ mod tests {
             signature: &[0u8; 65],
             extension: &extension,
             taking_amount: 0,
-            fynd_router: Address::ZERO,
+            router: Address::ZERO,
             primary_swap_calldata: &[],
-            surplus_router: Address::ZERO,
             surplus_calldata: &[],
             resolver_address: Address::ZERO,
         };

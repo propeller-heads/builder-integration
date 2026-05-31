@@ -434,10 +434,10 @@ async fn build_backrun_tx(
         None
     };
 
-    let (surplus_router, surplus_calldata) =
+    let surplus_calldata =
         match surplus_quote.as_ref().and_then(|q| q.transaction()) {
-            Some(tx) => (AlloyAddress::from_slice(tx.to().as_ref()), tx.data().to_vec()),
-            None => (AlloyAddress::ZERO, vec![]),
+            Some(tx) => tx.data().to_vec(),
+            None => vec![],
         };
 
     // Build RawOrderFields for fillContractOrder.
@@ -469,9 +469,8 @@ async fn build_backrun_tx(
         signature: &signature,
         extension: &extension,
         taking_amount,
-        fynd_router: backrunner.fynd_router,
+        router: backrunner.fynd_router,
         primary_swap_calldata: fynd_tx.data(),
-        surplus_router,
         surplus_calldata: &surplus_calldata,
         resolver_address: backrunner.resolver_address,
     };

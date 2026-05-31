@@ -3,6 +3,7 @@ pragma solidity ^0.8.25;
 
 import { Test } from "forge-std/Test.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 import { BackrunResolver } from "src/BackrunResolver.sol";
 import { Address, AddressLib, Order } from "src/interfaces/I1inchLOP.sol";
 
@@ -58,15 +59,18 @@ contract BackrunResolverTest is Test {
         vm.createSelectFork(vm.rpcUrl("mainnet"), FORK_BLOCK);
 
         // Deploy from OWNER. Because OWNER has a non-zero nonce on mainnet the resolver
-        // won't land at RESOLVER, so we capture the actual address and use _patchReceiver
-        // in fixture-based tests to redirect the Fynd output to wherever it actually is.
+        // won't land at FIXTURE_RECEIVER, so we capture the actual address and use
+        // _patchReceiver in fixture-based tests to redirect the Fynd output correctly.
         vm.startPrank(OWNER);
         resolver = new BackrunResolver(LOP, WETH);
         vm.stopPrank();
 
-        // Register EXECUTOR.
+        // Cache role constant before setting prank — vm.prank is consumed by the first
+        // external call, including STATICCALL; calling resolver.EXECUTOR_ROLE() inside
+        // the prank context would consume it before grantRole is reached.
+        bytes32 executorRole = resolver.EXECUTOR_ROLE();
         vm.prank(OWNER);
-        resolver.addExecutor(EXECUTOR);
+        resolver.grantRole(executorRole, EXECUTOR);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -77,33 +81,28 @@ contract BackrunResolverTest is Test {
     }
 
     /// @dev Replace the `receiver` field (param index 4, calldata word at offset 132) in a
-    ///      Fynd singleSwap/sequentialSwap calldata blob. The original fixture has
-    ///      FIXTURE_RECEIVER baked in; we overwrite it with the actual resolver address.
+    ///      Fynd singleSwap/sequentialSwap calldata blob.
     function _patchReceiver(bytes memory data, address newReceiver) internal pure {
-        // singleSwap receiver: param 4, word offset 132 bytes from start.
-        // The address occupies the lower 20 bytes of a 32-byte slot (bytes 144..163).
         require(data.length >= 164, "calldata too short for receiver patch");
         assembly {
-            // data points to the length slot; data+32 is byte 0 of the payload.
-            // Byte offset 132 into payload = data + 32 + 132 = data + 164.
-            // We store a full 32-byte word: zero-padded address.
             mstore(add(add(data, 32), 132), newReceiver)
         }
     }
 
-    /// @dev Build a minimal Order struct with only the fields the resolver uses.
-    function _makeOrder(address takerAsset) internal pure returns (Order memory o) {
+    /// @dev Build a minimal Order struct with maker and taker assets set.
+    function _makeOrder(address makerAsset, address takerAsset) internal pure returns (Order memory o) {
+        o.makerAsset = Address.wrap(uint256(uint160(makerAsset)));
         o.takerAsset = Address.wrap(uint256(uint160(takerAsset)));
     }
 
-    /// @dev Encode extraData for takerInteraction (no surplus swap).
+    /// @dev Encode extraData for takerInteraction.
+    ///      router is used for both the primary swap and the surplus→WETH swap.
     function _extraData(
         address router,
         bytes memory swapData,
-        address surplusRouter,
         bytes memory surplusData
     ) internal pure returns (bytes memory) {
-        return abi.encode(router, swapData, surplusRouter, surplusData);
+        return abi.encode(router, swapData, surplusData);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -112,8 +111,13 @@ contract BackrunResolverTest is Test {
 
     function test_settleOrders_revertsForNonExecutor() public {
         address stranger = makeAddr("stranger");
+        bytes32 executorRole = resolver.EXECUTOR_ROLE(); // cache before prank
         vm.prank(stranger);
-        vm.expectRevert(BackrunResolver.NotExecutor.selector);
+        vm.expectRevert(abi.encodeWithSelector(
+            IAccessControl.AccessControlUnauthorizedAccount.selector,
+            stranger,
+            executorRole
+        ));
         resolver.settleOrders(hex"");
     }
 
@@ -123,7 +127,7 @@ contract BackrunResolverTest is Test {
 
     function test_takerInteraction_revertsForNonLOP() public {
         address attacker = makeAddr("attacker");
-        Order memory o = _makeOrder(USDC);
+        Order memory o = _makeOrder(address(0), USDC);
 
         vm.prank(attacker);
         vm.expectRevert(BackrunResolver.OnlyLOP.selector);
@@ -144,7 +148,7 @@ contract BackrunResolverTest is Test {
     // ═══════════════════════════════════════════════════════════════════════
 
     function test_takerInteraction_revertsWhenNotTaker() public {
-        Order memory o = _makeOrder(USDC);
+        Order memory o = _makeOrder(address(0), USDC);
 
         vm.prank(LOP);
         vm.expectRevert(BackrunResolver.NotTaker.selector);
@@ -161,52 +165,54 @@ contract BackrunResolverTest is Test {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // 4. Owner management: add / remove executor
+    // 4. Role management: grant / revoke EXECUTOR_ROLE
     // ═══════════════════════════════════════════════════════════════════════
 
     function test_addRemoveExecutor() public {
         address newExec = makeAddr("newExec");
+        bytes32 role = resolver.EXECUTOR_ROLE();
 
-        assertFalse(resolver.executors(newExec));
-
-        vm.prank(OWNER);
-        resolver.addExecutor(newExec);
-        assertTrue(resolver.executors(newExec));
+        assertFalse(resolver.hasRole(role, newExec));
 
         vm.prank(OWNER);
-        resolver.removeExecutor(newExec);
-        assertFalse(resolver.executors(newExec));
+        resolver.grantRole(role, newExec);
+        assertTrue(resolver.hasRole(role, newExec));
+
+        vm.prank(OWNER);
+        resolver.revokeRole(role, newExec);
+        assertFalse(resolver.hasRole(role, newExec));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // 5. Access-control: approve – only owner
+    // 5. Access-control: approve – only DEFAULT_ADMIN_ROLE
     // ═══════════════════════════════════════════════════════════════════════
 
     function test_approve_revertsForNonOwner() public {
+        bytes32 adminRole = resolver.DEFAULT_ADMIN_ROLE(); // cache before prank
         vm.prank(EXECUTOR);
-        vm.expectRevert(BackrunResolver.OnlyOwner.selector);
+        vm.expectRevert(abi.encodeWithSelector(
+            IAccessControl.AccessControlUnauthorizedAccount.selector,
+            EXECUTOR,
+            adminRole
+        ));
         resolver.approve(USDC, FYND_ROUTER);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // 6. Primary swap: WETH → USDC via real Fynd calldata
+    // 6. Primary swap: WETH → USDC via real Fynd calldata (auto-approval)
     // ═══════════════════════════════════════════════════════════════════════
 
     function test_takerInteraction_primarySwap_weth_to_usdc() public {
         // Fund resolver with 1 WETH (the makerAsset sent by the LOP before callback).
         deal(WETH, address(resolver), 1 ether);
 
-        // Approve Fynd router to pull WETH from resolver.
-        vm.prank(OWNER);
-        resolver.approve(WETH, FYND_ROUTER);
-
         bytes memory swapCalldata = _readFixture("test/fixtures/weth_usdc_calldata.hex");
-        // Redirect Fynd output to the actual resolver address (fixture has a stale address).
         _patchReceiver(swapCalldata, address(resolver));
 
-        bytes memory extra = _extraData(FYND_ROUTER, swapCalldata, address(0), hex"");
+        bytes memory extra = _extraData(FYND_ROUTER, swapCalldata, hex"");
 
-        Order memory o = _makeOrder(USDC);
+        // makerAsset = WETH so auto-approval fires for WETH → FYND_ROUTER.
+        Order memory o = _makeOrder(WETH, USDC);
 
         uint256 usdcBefore = IERC20(USDC).balanceOf(address(resolver));
 
@@ -234,32 +240,22 @@ contract BackrunResolverTest is Test {
         address miner = makeAddr("miner");
         vm.coinbase(miner);
 
-        // Fund resolver with 1 WETH (makerAsset).
         deal(WETH, address(resolver), 1 ether);
 
-        // Approve Fynd router to pull WETH from resolver.
-        vm.prank(OWNER);
-        resolver.approve(WETH, FYND_ROUTER);
-
         bytes memory primaryCalldata = _readFixture("test/fixtures/weth_usdc_calldata.hex");
-        // Redirect primary swap output to actual resolver address.
         _patchReceiver(primaryCalldata, address(resolver));
 
         bytes memory surplusCalldata = _readFixture("test/fixtures/usdc_weth_calldata.hex");
-        // Redirect surplus swap output (WETH) to actual resolver address.
         _patchReceiver(surplusCalldata, address(resolver));
 
-        // Approve Fynd router to pull surplus USDC from resolver.
-        vm.prank(OWNER);
-        resolver.approve(USDC, FYND_ROUTER);
-
         // takingAmount is less than what the primary swap returns, so there IS surplus.
-        // We ask for fewer USDC so the remainder goes through the secondary swap.
         uint256 takingAmount = MIN_AMOUNT_RECEIVED - 1_000_000; // 1 USDC below output
 
-        bytes memory extra = _extraData(FYND_ROUTER, primaryCalldata, FYND_ROUTER, surplusCalldata);
+        bytes memory extra = _extraData(FYND_ROUTER, primaryCalldata, surplusCalldata);
 
-        Order memory o = _makeOrder(USDC);
+        // makerAsset = WETH: auto-approval fires for WETH → FYND_ROUTER.
+        // surplusCalldata non-empty: auto-approval fires for USDC → FYND_ROUTER.
+        Order memory o = _makeOrder(WETH, USDC);
 
         uint256 usdcBefore = IERC20(USDC).balanceOf(address(resolver));
         uint256 ethBefore = miner.balance;
@@ -276,10 +272,8 @@ contract BackrunResolverTest is Test {
             extra
         );
 
-        // Assert the primary swap actually delivered at least takingAmount USDC.
         uint256 usdcReceived = IERC20(USDC).balanceOf(address(resolver)) - usdcBefore;
         assertGe(usdcReceived, takingAmount, "primary swap did not return enough USDC");
-        // Surplus path is best-effort; log the coinbase result.
         emit log_named_uint("coinbase ETH gained", miner.balance - ethBefore);
     }
 
@@ -300,9 +294,10 @@ contract BackrunResolverTest is Test {
         uint256 takingAmount = 1 ether;
 
         bytes memory swapCalldata = hex""; // mock router ignores calldata
-        bytes memory extra = _extraData(address(mockRouter), swapCalldata, address(0), hex"");
+        // makerAsset = address(0): auto-approval for makerAsset is skipped.
+        bytes memory extra = _extraData(address(mockRouter), swapCalldata, hex"");
 
-        Order memory o = _makeOrder(WETH);
+        Order memory o = _makeOrder(address(0), WETH);
 
         uint256 ethBefore = miner.balance;
 
@@ -318,7 +313,6 @@ contract BackrunResolverTest is Test {
             extra
         );
 
-        // Resolver holds takingAmount WETH; surplus (1 WETH) was unwrapped → ETH → coinbase.
         assertEq(IERC20(WETH).balanceOf(address(resolver)), takingAmount, "WETH balance wrong");
         assertGt(miner.balance, ethBefore, "coinbase did not receive ETH");
     }
@@ -330,16 +324,12 @@ contract BackrunResolverTest is Test {
     function test_takerInteraction_revertsOnInsufficientOutput() public {
         deal(WETH, address(resolver), 1 ether);
 
-        vm.prank(OWNER);
-        resolver.approve(WETH, FYND_ROUTER);
-
         bytes memory swapCalldata = _readFixture("test/fixtures/weth_usdc_calldata.hex");
-        // Redirect Fynd output to actual resolver address.
         _patchReceiver(swapCalldata, address(resolver));
 
-        bytes memory extra = _extraData(FYND_ROUTER, swapCalldata, address(0), hex"");
+        bytes memory extra = _extraData(FYND_ROUTER, swapCalldata, hex"");
 
-        Order memory o = _makeOrder(USDC);
+        Order memory o = _makeOrder(WETH, USDC);
 
         // Ask for more USDC than any swap can possibly return.
         uint256 impossibleAmount = type(uint256).max;
@@ -364,7 +354,6 @@ contract BackrunResolverTest is Test {
     // ═══════════════════════════════════════════════════════════════════════
 
     function test_withdrawETH() public {
-        // Seed resolver with ETH.
         vm.deal(address(resolver), 1 ether);
 
         address payable recipient = payable(makeAddr("recipient"));

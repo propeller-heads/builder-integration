@@ -4,7 +4,7 @@ pragma solidity ^0.8.25;
 import { Script, console2 } from "forge-std/Script.sol";
 import { BackrunResolver } from "../src/BackrunResolver.sol";
 
-/// @notice Adds an executor EOA to a deployed BackrunResolver.
+/// @notice Grants EXECUTOR_ROLE to an EOA on a deployed BackrunResolver.
 ///
 /// Usage:
 ///   RESOLVER_ADDRESS=0x... EXECUTOR_ADDRESS=0x... \
@@ -18,11 +18,13 @@ contract AddExecutor is Script {
         address executorAddr = vm.envAddress("EXECUTOR_ADDRESS");
         uint256 ownerKey     = vm.envUint("OWNER_PRIVATE_KEY");
 
+        BackrunResolver resolver = BackrunResolver(payable(resolverAddr));
+
         vm.startBroadcast(ownerKey);
-        BackrunResolver(payable(resolverAddr)).addExecutor(executorAddr);
+        resolver.grantRole(resolver.EXECUTOR_ROLE(), executorAddr);
         vm.stopBroadcast();
 
-        console2.log("Added executor:", executorAddr);
-        console2.log("To resolver:   ", resolverAddr);
+        console2.log("Granted EXECUTOR_ROLE to:", executorAddr);
+        console2.log("On resolver:             ", resolverAddr);
     }
 }
