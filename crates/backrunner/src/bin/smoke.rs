@@ -22,7 +22,7 @@
 
 use std::{collections::HashMap, env, time::Duration};
 
-use alloy::primitives::{address, keccak256, Address as AlloyAddress, Bytes as AlloyBytes, B256};
+use alloy::primitives::{address, keccak256, map::B256HashMap, Address as AlloyAddress, Bytes as AlloyBytes, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::state::AccountOverride;
 use anyhow::{Context, Result};
@@ -243,7 +243,7 @@ async fn run_block_loop(
                             //   = keccak256(caller || keccak256(EXECUTOR_ROLE || 0))
                             state_diff: Some({
                                 let executor_role_slot = executor_role_has_role_slot(resolver_addr);
-                                let mut diff = HashMap::new();
+                                let mut diff = B256HashMap::default();
                                 diff.insert(executor_role_slot, B256::from(alloy::primitives::U256::from(1)));
                                 diff
                             }),
