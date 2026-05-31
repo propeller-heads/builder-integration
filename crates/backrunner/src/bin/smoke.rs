@@ -112,6 +112,7 @@ async fn main() -> Result<()> {
         protocols: vec![
             "uniswap_v2".to_owned(),
             "uniswap_v3".to_owned(),
+            "uniswap_v4".to_owned(),
             "sushiswap_v2".to_owned(),
             "pancakeswap_v2".to_owned(),
             "pancakeswap_v3".to_owned(),
