@@ -30,7 +30,7 @@ struct Cli {
         env = "PROTOCOLS",
         value_delimiter = ',',
         default_values = [
-            "uniswap_v2", "uniswap_v3", "uniswap_v4",
+            "uniswap_v2", "uniswap_v3",
             "sushiswap_v2", "pancakeswap_v2", "pancakeswap_v3",
             "vm:maverick_v2", "fluid_v1",
         ]
