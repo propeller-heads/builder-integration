@@ -67,18 +67,32 @@ async fn main() -> Result<()> {
     let provider = ProviderBuilder::new()
         .connect_http(rpc_url.parse().context("invalid ETH_RPC_URL")?);
 
-    let resolver_addr: AlloyAddress = env::var("RESOLVER_ADDRESS")
+    // If RESOLVER_ADDRESS is set to a real address, trust the deployed contract's code.
+    // Otherwise use the virtual address with a bytecode state override so no deployment
+    // is needed.
+    let deployed_addr: Option<AlloyAddress> = env::var("RESOLVER_ADDRESS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .filter(|a: &AlloyAddress| !a.is_zero())
-        .unwrap_or(VIRTUAL_RESOLVER);
+        .filter(|a: &AlloyAddress| !a.is_zero());
 
-    let resolver_bytecode: AlloyBytes = RESOLVER_BYTECODE_HEX
-        .trim()
-        .parse()
-        .context("embedded resolver bytecode is not valid hex")?;
-
-    tracing::info!(%resolver_addr, bytecode_bytes = resolver_bytecode.len(), "resolver ready (bytecode override)");
+    let (resolver_addr, resolver_bytecode) = match deployed_addr {
+        Some(addr) => {
+            tracing::info!(%addr, "using deployed resolver (no bytecode override)");
+            (addr, None)
+        }
+        None => {
+            let bytecode: AlloyBytes = RESOLVER_BYTECODE_HEX
+                .trim()
+                .parse()
+                .context("embedded resolver bytecode is not valid hex")?;
+            tracing::info!(
+                addr = %VIRTUAL_RESOLVER,
+                bytecode_bytes = bytecode.len(),
+                "no RESOLVER_ADDRESS set — using virtual address with bytecode override"
+            );
+            (VIRTUAL_RESOLVER, Some(bytecode))
+        }
+    };
 
     let chain_id: u64 = env::var("CHAIN_ID")
         .ok()
@@ -124,16 +138,7 @@ async fn main() -> Result<()> {
     tokio::spawn(backrunner.run(event_rx, candidate_tx));
 
     tracing::info!("entering block loop...");
-    run_block_loop(
-        &mut market_rx,
-        market_data,
-        event_tx,
-        &mut candidate_rx,
-        provider,
-        resolver_addr,
-        resolver_bytecode,
-    )
-    .await
+    run_block_loop(&mut market_rx, market_data, event_tx, &mut candidate_rx, provider, resolver_addr, resolver_bytecode).await
 }
 
 async fn run_block_loop(
@@ -143,7 +148,7 @@ async fn run_block_loop(
     candidate_rx: &mut watch::Receiver<Option<BackrunCandidate>>,
     provider: impl Provider + Clone + 'static,
     resolver_addr: AlloyAddress,
-    resolver_bytecode: AlloyBytes,
+    resolver_bytecode: Option<AlloyBytes>,
 ) -> Result<()> {
     loop {
         let event = match market_rx.recv().await {
@@ -219,16 +224,15 @@ async fn run_block_loop(
                         .value(backrun_tx.tx.value)
                         .input(backrun_tx.tx.data.clone().into());
 
-                    let result = provider
-                        .call(tx_req)
-                        .account_override(
-                            resolver_addr,
-                            AccountOverride {
-                                code: Some(resolver_bytecode.clone()),
-                                ..Default::default()
-                            },
-                        )
-                        .await;
+                    let state_override = resolver_bytecode.as_ref().map(|bytecode| {
+                        let mut m = alloy::rpc::types::state::StateOverride::default();
+                        m.insert(resolver_addr, AccountOverride {
+                            code: Some(bytecode.clone()),
+                            ..Default::default()
+                        });
+                        m
+                    });
+                    let result = provider.call(tx_req).overrides_opt(state_override).await;
 
                     match result {
                         Ok(output) => {
