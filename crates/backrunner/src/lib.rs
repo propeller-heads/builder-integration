@@ -28,11 +28,12 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use alloy::primitives::Address as AlloyAddress;
 
-use builder_types::{BackrunCandidate, BlockEnv, BuildEvent, ExecutedTx, PostState};
+use abi::{build_settle_calldata, RawOrderFields, SettleParams};
+use builder_types::{BackrunCandidate, BackrunTx, BlockEnv, BuildEvent, ExecutedTx, PostState, RawTx};
 use client::OneinchClient;
 use fynd_core::{
-    feed::market_data::MarketData, FyndBuilder, MarketEvent, Order, OrderSide,
-    PendingBlockProcessor, PendingError, QuoteOptions, QuoteRequest, Solver, SolveError,
+    feed::market_data::MarketData, EncodingOptions, FyndBuilder, MarketEvent, Order, OrderQuote,
+    OrderSide, PendingBlockProcessor, PendingError, QuoteOptions, QuoteRequest, Solver, SolveError,
     SolverBuildError,
 };
 use num_bigint::BigUint;
@@ -107,11 +108,8 @@ pub struct Backrunner {
     pending: tokio::sync::Mutex<PendingBlockProcessor>,
     /// Receiver for the current set of live Fusion orders (refreshed ~every 12s).
     orders_rx: watch::Receiver<Arc<Vec<FusionOrder>>>,
-    #[expect(dead_code, reason = "read in Task 3 when building BackrunCandidate calldata")]
     pub(crate) resolver_address: AlloyAddress,
-    #[expect(dead_code, reason = "read in Task 3 when building BackrunCandidate calldata")]
     pub(crate) fynd_router: AlloyAddress,
-    #[expect(dead_code, reason = "read in Task 3 for Fynd quote slippage")]
     pub(crate) slippage: f64,
 }
 
@@ -328,25 +326,183 @@ async fn evaluate_backrun(
         return None;
     }
 
-    match try_evaluate(backrunner, uuid, &iter, &active).await {
-        Ok(Some(quote)) => {
-            debug!(
-                %uuid,
-                block_number = iter.block.block_number,
-                solve_time_ms = quote.solve_time_ms(),
-                orders_quoted = active.len(),
-                "backrun quote received",
-            );
-        }
+    let quote = match try_evaluate(backrunner, uuid, &iter, &active).await {
+        Ok(Some(q)) => q,
         Ok(None) => {
             debug!(%uuid, "parent block not yet confirmed, skipping");
+            return None;
         }
         Err(e) => {
             warn!(%uuid, error = %e, "evaluate_backrun failed");
+            return None;
+        }
+    };
+
+    // Build a map from order_id → FusionOrder for fast lookup.
+    let order_map: HashMap<&str, &FusionOrder> =
+        active.iter().map(|o| (o.order_id.as_str(), *o)).collect();
+
+    let ctx = BackrunContext {
+        uuid,
+        block_ts,
+        base_fee: iter.block.base_fee_per_gas,
+        block_number: iter.block.block_number,
+        solve_time_ms: quote.solve_time_ms(),
+        orders_quoted: active.len(),
+        backrunner,
+    };
+
+    let mut backrun_txs: Vec<BackrunTx> = Vec::new();
+
+    for order_quote in quote.orders() {
+        let Some(fynd_tx) = order_quote.transaction() else { continue };
+        let Some(&fusion_order) = order_map.get(order_quote.order_id()) else { continue };
+
+        if let Some(backrun_tx) =
+            build_backrun_tx(&ctx, fusion_order, order_quote, fynd_tx).await
+        {
+            backrun_txs.push(backrun_tx);
         }
     }
 
-    None
+    if backrun_txs.is_empty() {
+        return None;
+    }
+
+    Some(BackrunCandidate {
+        uuid,
+        block_number: iter.block.block_number,
+        txs: backrun_txs,
+    })
+}
+
+/// Iteration-level context shared across all per-order calls inside [`evaluate_backrun`].
+struct BackrunContext<'a> {
+    uuid: Uuid,
+    block_ts: u64,
+    base_fee: u64,
+    block_number: u64,
+    solve_time_ms: u64,
+    orders_quoted: usize,
+    backrunner: &'a Backrunner,
+}
+
+/// Builds a single [`BackrunTx`] for one matched Fusion order quote.
+///
+/// Returns `None` when the swap output is below the auction price or order fields are invalid.
+async fn build_backrun_tx(
+    ctx: &BackrunContext<'_>,
+    fusion_order: &FusionOrder,
+    order_quote: &OrderQuote,
+    fynd_tx: &fynd_core::Transaction,
+) -> Option<BackrunTx> {
+    let BackrunContext { uuid, block_ts, base_fee, block_number, solve_time_ms, orders_quoted, backrunner } = ctx;
+    let taking_amount = amount_at_timestamp(fusion_order, *block_ts)?;
+
+    // Check that the Fynd swap output is at least the auction's required taking amount.
+    let digits = order_quote.amount_out().to_u64_digits();
+    if digits.is_empty() {
+        return None;
+    }
+    let amount_out_u128 = if digits.len() > 2 {
+        u128::MAX // overflow guard: treat as very profitable
+    } else {
+        digits
+            .iter()
+            .enumerate()
+            .fold(0u128, |acc, (i, &d)| acc | (u128::from(d) << (i * 64)))
+    };
+
+    if amount_out_u128 < taking_amount {
+        debug!(%uuid, order_id = %fusion_order.order_id, "swap output below auction price, skipping");
+        return None;
+    }
+
+    // Get secondary Fynd quote for surplus → WETH (async, best-effort).
+    let surplus_amount = amount_out_u128.saturating_sub(taking_amount);
+    let surplus_state_label = format!("surplus-{uuid}");
+    let surplus_quote = if surplus_amount > 0 {
+        quote_surplus_swap(
+            &backrunner.solver,
+            &fusion_order.to_token,
+            surplus_amount,
+            backrunner.resolver_address,
+            surplus_state_label,
+        )
+        .await
+    } else {
+        None
+    };
+
+    let (surplus_router, surplus_calldata) =
+        match surplus_quote.as_ref().and_then(|q| q.transaction()) {
+            Some(tx) => (AlloyAddress::from_slice(tx.to().as_ref()), tx.data().to_vec()),
+            None => (AlloyAddress::ZERO, vec![]),
+        };
+
+    // Build RawOrderFields for fillContractOrder.
+    let raw_order = match build_raw_order_fields(fusion_order) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(%uuid, order_id = %fusion_order.order_id, "bad order fields: {e}");
+            return None;
+        }
+    };
+
+    let signature = match hex_to_bytes(&fusion_order.signature) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%uuid, "bad signature: {e}");
+            return None;
+        }
+    };
+    let extension = match hex_to_bytes(&fusion_order.extension) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%uuid, "bad extension: {e}");
+            return None;
+        }
+    };
+
+    let params = SettleParams {
+        order_fields: &raw_order,
+        signature: &signature,
+        extension: &extension,
+        taking_amount,
+        fynd_router: backrunner.fynd_router,
+        primary_swap_calldata: fynd_tx.data(),
+        surplus_router,
+        surplus_calldata: &surplus_calldata,
+        resolver_address: backrunner.resolver_address,
+    };
+    let settle_data = build_settle_calldata(&params);
+
+    let raw_tx = RawTx {
+        to: Some(backrunner.resolver_address),
+        value: alloy::primitives::U256::ZERO,
+        data: settle_data,
+        gas_limit: 500_000,
+        max_fee_per_gas: u128::from(*base_fee) * 2 + 1_000_000_000,
+        max_priority_fee_per_gas: 100_000_000, // 0.1 gwei tip
+    };
+
+    let expected_profit = alloy::primitives::I256::try_from(
+        i128::try_from(surplus_amount).unwrap_or(i128::MAX),
+    )
+    .unwrap_or_default();
+
+    debug!(
+        %uuid,
+        block_number,
+        solve_time_ms,
+        orders_quoted,
+        taking_amount,
+        amount_out = amount_out_u128,
+        surplus = surplus_amount,
+        "backrun candidate built",
+    );
+
+    Some(BackrunTx { tx: raw_tx, expected_profit_wei: expected_profit, expected_gas: 300_000 })
 }
 
 async fn try_evaluate(
@@ -386,10 +542,14 @@ async fn try_evaluate(
         .register_labeled_state(label.clone(), states, valid_until)
         .await;
 
-    let fynd_orders: Vec<Order> =
-        active_orders.iter().filter_map(|o| fusion_order_to_fynd(o)).collect();
+    let fynd_orders: Vec<Order> = active_orders
+        .iter()
+        .filter_map(|o| fusion_order_to_fynd(o, backrunner.resolver_address))
+        .collect();
 
-    let options = QuoteOptions::default().with_state_label(label.clone());
+    let options = QuoteOptions::default()
+        .with_state_label(label.clone())
+        .with_encoding_options(EncodingOptions::new(backrunner.slippage));
     let request = QuoteRequest::new(fynd_orders, options);
     let quote_result = backrunner.solver.quote(request).await;
 
@@ -398,10 +558,49 @@ async fn try_evaluate(
     Ok(Some(quote_result.map_err(EvaluateError::Solve)?))
 }
 
+/// Quotes a surplus→WETH swap via Fynd. Returns the `OrderQuote` if a route exists.
+///
+/// Returns `None` if `token_in` is WETH (direct unwrap; no swap needed) or no route found.
+/// Uses 100% slippage (minAmountOut = 0) so amountIn can be patched on-chain safely.
+async fn quote_surplus_swap(
+    solver: &Solver,
+    token_in_hex: &str,
+    surplus_amount: u128,
+    resolver_address: AlloyAddress,
+    state_label: fynd_core::StateLabel,
+) -> Option<OrderQuote> {
+    const WETH_HEX: &str = "0xC02aAA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+    if token_in_hex.eq_ignore_ascii_case(WETH_HEX) {
+        return None; // surplus WETH unwrapped directly — no swap needed
+    }
+    let from_bytes = parse_address(token_in_hex).ok()?;
+    let to_bytes = parse_address(WETH_HEX).ok()?;
+    let sender = TychoBytes::from(resolver_address.as_slice().to_vec());
+    let order = Order::new(
+        from_bytes,
+        to_bytes,
+        BigUint::from(surplus_amount),
+        OrderSide::Sell,
+        sender,
+    );
+    // 100% slippage → minAmountOut = 0; resolver patches amountIn on-chain.
+    let options = QuoteOptions::default()
+        .with_state_label(state_label)
+        .with_encoding_options(EncodingOptions::new(1.0));
+    let request = QuoteRequest::new(vec![order], options);
+    match solver.quote(request).await {
+        Ok(quote) => quote.into_orders().into_iter().next(),
+        Err(e) => {
+            debug!("surplus swap quote failed: {e}");
+            None
+        }
+    }
+}
+
 /// Converts a [`FusionOrder`] to a fynd [`Order`].
 ///
 /// Returns `None` when the token address is malformed — these are silently skipped.
-fn fusion_order_to_fynd(fusion: &FusionOrder) -> Option<Order> {
+fn fusion_order_to_fynd(fusion: &FusionOrder, resolver_address: AlloyAddress) -> Option<Order> {
     let from_bytes = parse_address(&fusion.from_token)
         .map_err(|e| tracing::warn!(order_id = %fusion.order_id, "bad from_token: {e}"))
         .ok()?;
@@ -409,10 +608,39 @@ fn fusion_order_to_fynd(fusion: &FusionOrder) -> Option<Order> {
         .map_err(|e| tracing::warn!(order_id = %fusion.order_id, "bad to_token: {e}"))
         .ok()?;
     let amount = BigUint::from(fusion.making_amount);
+    let sender = TychoBytes::from(resolver_address.as_slice().to_vec());
     Some(
-        Order::new(from_bytes, to_bytes, amount, OrderSide::Sell, TychoBytes::zero(20))
+        Order::new(from_bytes, to_bytes, amount, OrderSide::Sell, sender)
             .with_id(fusion.order_id.clone()),
     )
+}
+
+fn build_raw_order_fields(fusion: &FusionOrder) -> anyhow::Result<RawOrderFields> {
+    use alloy::primitives::U256;
+    use std::str::FromStr;
+    Ok(RawOrderFields {
+        salt: U256::from_str(&fusion.salt).unwrap_or_default(),
+        maker: address_str_to_u256(&fusion.maker_address)?,
+        receiver: address_str_to_u256(&fusion.receiver_address)?,
+        maker_asset: address_str_to_u256(&fusion.from_token)?,
+        taker_asset: address_str_to_u256(&fusion.to_token)?,
+        making_amount: U256::from(fusion.making_amount),
+        taking_amount: U256::from(fusion.auction_end_amount),
+        maker_traits: U256::from_str(&fusion.maker_traits).unwrap_or_default(),
+    })
+}
+
+fn address_str_to_u256(hex: &str) -> anyhow::Result<alloy::primitives::U256> {
+    let addr = parse_address(hex)?;
+    Ok(alloy::primitives::U256::from_be_slice(addr.as_ref()))
+}
+
+fn hex_to_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    if stripped.is_empty() {
+        return Ok(vec![]);
+    }
+    hex::decode(stripped).map_err(|e| anyhow::anyhow!("hex decode: {e}"))
 }
 
 /// Decodes a `0x`-prefixed 20-byte address hex string into `TychoBytes`.
