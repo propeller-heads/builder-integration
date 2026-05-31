@@ -22,7 +22,7 @@
 
 use std::{collections::HashMap, env, time::Duration};
 
-use alloy::primitives::{address, Address as AlloyAddress, Bytes as AlloyBytes};
+use alloy::primitives::{address, keccak256, Address as AlloyAddress, Bytes as AlloyBytes, B256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::state::AccountOverride;
 use anyhow::{Context, Result};
@@ -237,6 +237,16 @@ async fn run_block_loop(
                         let mut m = alloy::rpc::types::state::StateOverride::default();
                         m.insert(resolver_addr, AccountOverride {
                             code: Some(bytecode.clone()),
+                            // Grant EXECUTOR_ROLE to the caller so settleOrders passes the
+                            // AccessControl check. OZ storage layout (slot 0 = _roles mapping):
+                            //   _roles[EXECUTOR_ROLE].hasRole[caller]
+                            //   = keccak256(caller || keccak256(EXECUTOR_ROLE || 0))
+                            state_diff: Some({
+                                let executor_role_slot = executor_role_has_role_slot(resolver_addr);
+                                let mut diff = HashMap::new();
+                                diff.insert(executor_role_slot, B256::from(alloy::primitives::U256::from(1)));
+                                diff
+                            }),
                             ..Default::default()
                         });
                         m
@@ -265,6 +275,28 @@ async fn run_block_loop(
             }
         }
     }
+}
+
+/// Computes the storage slot for `_roles[EXECUTOR_ROLE].hasRole[account]` in the
+/// OpenZeppelin AccessControl contract (slot 0 = `_roles` mapping, no ERC7201 namespace).
+///
+/// Layout:
+///   roleDataSlot = keccak256(EXECUTOR_ROLE || uint256(0))
+///   hasRoleSlot  = keccak256(account_padded || roleDataSlot)
+fn executor_role_has_role_slot(account: AlloyAddress) -> B256 {
+    let executor_role: B256 = keccak256(b"EXECUTOR_ROLE");
+
+    // keccak256(EXECUTOR_ROLE || 0) — slot of _roles[EXECUTOR_ROLE]
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(executor_role.as_slice());
+    // last 32 bytes stay zero = uint256(0)
+    let role_data_slot: B256 = keccak256(&buf);
+
+    // keccak256(account_padded || roleDataSlot) — slot of hasRole[account]
+    let mut buf2 = [0u8; 64];
+    buf2[12..32].copy_from_slice(account.as_slice()); // address left-padded to 32 bytes
+    buf2[32..].copy_from_slice(role_data_slot.as_slice());
+    keccak256(&buf2)
 }
 
 /// Returns the block info for the last confirmed block, or `None` if not yet available.
