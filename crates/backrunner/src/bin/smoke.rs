@@ -4,14 +4,16 @@
 //! builder iteration per block, exercising the complete pipeline on every block.
 //!
 //! Required env vars:
-//!   `TYCHO_URL`      — Tycho WebSocket host
-//!   `ETH_RPC_URL`    — Ethereum JSON-RPC endpoint (used by the backrunner internally)
-//!   `TYCHO_API_KEY`  — (optional) Tycho API key
-//!   `CHAIN_ID`       — (optional, default 1) 1inch Fusion chain ID
+//!   `TYCHO_URL`         — Tycho WebSocket host
+//!   `ETH_RPC_URL`       — Ethereum JSON-RPC endpoint (used by the backrunner internally)
+//!   `TYCHO_API_KEY`     — (optional) Tycho API key
+//!   `CHAIN_ID`          — (optional, default 1) 1inch Fusion chain ID
+//!   `RESOLVER_ADDRESS`  — (optional, default `address(0)`) Address to call from in `eth_call`
 
 use std::{collections::HashMap, env, time::Duration};
 
 use alloy::primitives::Address as AlloyAddress;
+use alloy::providers::{Provider, ProviderBuilder};
 use anyhow::{Context, Result};
 use backrunner::{Backrunner, BackrunnerConfig};
 use builder_types::{BackrunCandidate, BlockEnv, BuildEvent, PostState};
@@ -34,6 +36,14 @@ async fn main() -> Result<()> {
     let tycho_url = env::var("TYCHO_URL").context("TYCHO_URL not set")?;
     let rpc_url = env::var("ETH_RPC_URL").context("ETH_RPC_URL not set")?;
     let tycho_api_key = env::var("TYCHO_API_KEY").ok();
+
+    let provider = ProviderBuilder::new()
+        .connect_http(rpc_url.parse().context("invalid ETH_RPC_URL")?);
+
+    let resolver_addr: AlloyAddress = env::var("RESOLVER_ADDRESS")
+        .unwrap_or_else(|_| "0x0000000000000000000000000000000000000000".to_string())
+        .parse()
+        .unwrap_or_default();
     let chain_id: u64 = env::var("CHAIN_ID")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -78,7 +88,7 @@ async fn main() -> Result<()> {
     tokio::spawn(backrunner.run(event_rx, candidate_tx));
 
     tracing::info!("entering block loop...");
-    run_block_loop(&mut market_rx, market_data, event_tx, &mut candidate_rx).await
+    run_block_loop(&mut market_rx, market_data, event_tx, &mut candidate_rx, provider, resolver_addr).await
 }
 
 async fn run_block_loop(
@@ -86,6 +96,8 @@ async fn run_block_loop(
     market_data: MarketData,
     event_tx: mpsc::Sender<BuildEvent>,
     candidate_rx: &mut watch::Receiver<Option<BackrunCandidate>>,
+    provider: impl Provider + Clone + 'static,
+    resolver_addr: AlloyAddress,
 ) -> Result<()> {
     loop {
         let event = match market_rx.recv().await {
@@ -139,10 +151,50 @@ async fn run_block_loop(
             return Ok(());
         }
 
-        // Give evaluate_backrun time to complete before logging.
+        // Give evaluate_backrun time to complete before reading the candidate.
         tokio::time::sleep(Duration::from_secs(5)).await;
         let candidate = candidate_rx.borrow().clone();
-        tracing::info!(block_number, ?candidate, "iteration result");
+        match &candidate {
+            None => {
+                tracing::info!(block_number, "iteration result: no candidate");
+            }
+            Some(c) if c.txs.is_empty() => {
+                tracing::info!(block_number, "iteration result: empty candidate");
+            }
+            Some(c) => {
+                tracing::info!(
+                    block_number,
+                    txs = c.txs.len(),
+                    "candidate found — validating via eth_call"
+                );
+                for (i, backrun_tx) in c.txs.iter().enumerate() {
+                    let tx_req = alloy::rpc::types::TransactionRequest::default()
+                        .from(resolver_addr)
+                        .to(backrun_tx.tx.to.unwrap_or_default())
+                        .value(backrun_tx.tx.value)
+                        .input(backrun_tx.tx.data.clone().into());
+
+                    match provider.call(tx_req).await {
+                        Ok(output) => {
+                            tracing::info!(
+                                block_number,
+                                tx_index = i,
+                                output_bytes = output.len(),
+                                "eth_call SUCCESS ✓"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                block_number,
+                                tx_index = i,
+                                error = %e,
+                                "eth_call REVERTED"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
