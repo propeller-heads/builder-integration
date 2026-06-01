@@ -48,11 +48,12 @@ sol! {
         ) external payable returns (uint256, uint256, bytes32);
 
         // Selector 0xf497df75: taker is a contract, maker is an EOA.
-        // LOP uses ecrecover(hash, r, s, v) where v comes from makerTraits bit 247.
+        // LOP uses ecrecover(hash, r, vs) where vs = s with top bit encoding v parity
+        // (EIP-2098 compact form: vs = s | ((v - 27) << 255)).
         function fillOrderArgs(
             Order calldata order,
             bytes32 r,
-            bytes32 s,
+            bytes32 vs,
             uint256 amount,
             uint256 takerTraits,
             bytes calldata args
@@ -144,15 +145,20 @@ pub fn build_settle_calldata(p: &SettleParams<'_>) -> Bytes {
 
     let fill_calldata = if p.signature.len() == 65 {
         // EOA-signed order: use fillOrderArgs (ecrecover path).
-        // r = sig[0..32], s = sig[32..64]; v (sig[64]) is encoded in makerTraits bit 247.
+        // Compact EIP-2098 format: vs = s | ((v - 27) << 255)
         let mut r = [0u8; 32];
-        let mut s = [0u8; 32];
+        let mut vs_bytes = [0u8; 32];
         r.copy_from_slice(&p.signature[..32]);
-        s.copy_from_slice(&p.signature[32..64]);
+        vs_bytes.copy_from_slice(&p.signature[32..64]);
+        let v = p.signature[64];
+        // Encode v parity into the top bit of vs (0x80 of byte 0 in big-endian)
+        if v == 28 {
+            vs_bytes[0] |= 0x80;
+        }
         IOrderMixin::fillOrderArgsCall {
             order,
             r: r.into(),
-            s: s.into(),
+            vs: vs_bytes.into(),
             amount: p.order_fields.making_amount,
             takerTraits: taker_traits,
             args: Bytes::from(args),
