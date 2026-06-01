@@ -49,10 +49,10 @@ sol! {
     }
 }
 
-/// Bit 249: args contains a 20-byte interaction target address + callback data.
-const ARGS_HAS_TARGET_BIT: u8 = 249;
-/// Bit 248: args starts with Fusion extension bytes.
-const ARGS_HAS_EXTENSION_BIT: u8 = 248;
+/// Bit 251: args contains a 20-byte interaction target address + callback data.
+const ARGS_HAS_TARGET_BIT: u8 = 251;
+/// Bit 250: args starts with Fusion extension bytes.
+const ARGS_HAS_EXTENSION_BIT: u8 = 250;
 
 /// Decoded order fields in U256 form (matching 1inch LOP v4's packed Address type).
 pub struct RawOrderFields {
