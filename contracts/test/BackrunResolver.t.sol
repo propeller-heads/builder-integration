@@ -36,6 +36,7 @@ contract BackrunResolverTest is Test {
     address constant LOP         = 0x111111125421cA6dc452d289314280a0f8842A65;
     address constant WETH        = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
     address constant USDC        = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    // Original Fynd router — fixtures were generated for this address at fork block 25209740
     address constant FYND_ROUTER = 0x1f8dB310f32D48B6180fF902EC60C586128cEf47;
 
     // Anvil account 0 → owner, Anvil account 1 → executor.

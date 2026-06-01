@@ -22,7 +22,8 @@
 
 use std::{collections::HashMap, env, time::Duration};
 
-use alloy::primitives::{address, keccak256, map::B256HashMap, Address as AlloyAddress, Bytes as AlloyBytes, B256};
+use alloy::primitives::{keccak256, map::B256HashMap, Address as AlloyAddress, Bytes as AlloyBytes, B256};
+use alloy::primitives::address;
 use alloy::providers::{ext::DebugApi, Provider, ProviderBuilder};
 use alloy::rpc::types::state::AccountOverride;
 use alloy::rpc::types::trace::geth::{
@@ -37,9 +38,6 @@ use uuid::Uuid;
 
 const READY_TIMEOUT_MINS: u64 = 10;
 const ORDERBOOK_WAIT_SECS: u64 = 15;
-
-/// Fynd/Tycho router on Ethereum mainnet.
-const FYND_ROUTER: AlloyAddress = address!("1f8dB310f32D48B6180fF902EC60C586128cEf47");
 
 /// Synthetic resolver address whose lower 10 bytes match the standard 1inch Fusion
 /// resolver whitelist entries (`b09498030ae3416b66dc` = entry [0] in every active order).
@@ -129,7 +127,6 @@ async fn main() -> Result<()> {
         ready_timeout: Duration::from_mins(READY_TIMEOUT_MINS),
         chain_id,
         resolver_address: resolver_addr,
-        fynd_router: FYND_ROUTER,
         slippage: 0.005,
     };
 

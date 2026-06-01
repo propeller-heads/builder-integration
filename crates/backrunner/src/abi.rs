@@ -109,27 +109,40 @@ pub struct SettleParams<'a> {
 #[must_use]
 pub fn build_settle_calldata(p: &SettleParams<'_>) -> Bytes {
     // ── extraData for takerInteraction ──────────────────────────────────────
-    // abi.encode(router, swapCalldata, surplusCalldata)
+    // Flat ABI params encoding: (router, swapCalldata, surplusCalldata)
+    // Must use abi_encode_sequence (not abi_encode) to avoid the outer tuple
+    // offset wrapper that abi_encode adds for dynamic types.
     let extra_data: Vec<u8> = (
         p.router,
         Bytes::copy_from_slice(p.primary_swap_calldata),
         Bytes::copy_from_slice(p.surplus_calldata),
     )
-        .abi_encode();
+        .abi_encode_sequence();
 
-    // ── args = resolver_address(20B) ++ extension ++ extra_data(interaction) ─
-    // LOP._parseArgs strips target first, then reads extensionLength/interactionLength
-    // bytes from takerTraits bit fields.
-    let mut args = Vec::with_capacity(20 + p.extension.len() + extra_data.len());
-    args.extend_from_slice(p.resolver_address.as_slice()); // target stripped first by LOP
+    // ── Interaction bytes: [resolver_addr 20B raw][extra_data] ─────────────
+    // The LOP calls ITakerInteraction(bytes20(interaction)).takerInteraction(
+    //   ..., interaction[20:]
+    // )
+    // bytes20(interaction) takes the FIRST 20 raw bytes — our resolver address.
+    // interaction[20:] = extra_data is passed as extraData to takerInteraction.
+    let mut interaction = Vec::with_capacity(20 + extra_data.len());
+    interaction.extend_from_slice(p.resolver_address.as_slice()); // 20 raw bytes = takerInteraction target
+    interaction.extend_from_slice(&extra_data);
+
+    // ── args = resolver_address(20B) ++ extension ++ interaction ────────────
+    // LOP._parseArgs: strips `target` (ARGS_HAS_TARGET) from front, then
+    // reads extensionLength + interactionLength bytes from takerTraits.
+    // The stripped `target` = where makerAsset is sent (our resolver).
+    let mut args = Vec::with_capacity(20 + p.extension.len() + interaction.len());
+    args.extend_from_slice(p.resolver_address.as_slice()); // target: WETH goes here
     args.extend_from_slice(p.extension);
-    args.extend_from_slice(&extra_data);
+    args.extend_from_slice(&interaction);
 
     // ── takerTraits ─────────────────────────────────────────────────────────
     let mut taker_traits = U256::from(p.taking_amount); // bits 0-184 = threshold
     taker_traits |= U256::from(1u64) << ARGS_HAS_TARGET_BIT;
     taker_traits |= U256::from(p.extension.len() as u64) << ARGS_EXTENSION_LENGTH_OFFSET;
-    taker_traits |= U256::from(extra_data.len() as u64) << ARGS_INTERACTION_LENGTH_OFFSET;
+    taker_traits |= U256::from(interaction.len() as u64) << ARGS_INTERACTION_LENGTH_OFFSET;
 
     // ── fill calldata: EOA makers use fillOrderArgs, ERC-1271 makers use fillContractOrderArgs
     let order = IOrderMixin::Order {

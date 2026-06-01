@@ -23,6 +23,8 @@
 pub mod abi;
 mod client;
 mod order;
+#[cfg(test)]
+mod encode_test;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -72,8 +74,6 @@ pub struct BackrunnerConfig {
     pub resolver_address: AlloyAddress,
     /// Slippage tolerance for Fynd quotes (0.005 = 0.5%).
     pub slippage: f64,
-    /// Fynd/Tycho router address passed in resolver extraData.
-    pub fynd_router: AlloyAddress,
 }
 
 /// Error returned by [`Backrunner::build`].
@@ -109,7 +109,6 @@ pub struct Backrunner {
     /// Receiver for the current set of live Fusion orders (refreshed ~every 12s).
     orders_rx: watch::Receiver<Arc<Vec<FusionOrder>>>,
     pub(crate) resolver_address: AlloyAddress,
-    pub(crate) fynd_router: AlloyAddress,
     pub(crate) slippage: f64,
 }
 
@@ -154,7 +153,6 @@ impl Backrunner {
             pending: tokio::sync::Mutex::new(pending),
             orders_rx,
             resolver_address: config.resolver_address,
-            fynd_router: config.fynd_router,
             slippage: config.slippage,
         })
     }
@@ -434,10 +432,12 @@ async fn build_backrun_tx(
         None
     };
 
-    let surplus_calldata =
+    // Extract surplus router and calldata from the surplus quote transaction.
+    // The surplus router comes from the transaction's `to` address — same pattern as primary.
+    let (surplus_router, surplus_calldata) =
         match surplus_quote.as_ref().and_then(|q| q.transaction()) {
-            Some(tx) => tx.data().to_vec(),
-            None => vec![],
+            Some(tx) => (AlloyAddress::from_slice(tx.to().as_ref()), tx.data().to_vec()),
+            None => (AlloyAddress::ZERO, vec![]),
         };
 
     // Build RawOrderFields for fillContractOrder.
@@ -464,16 +464,19 @@ async fn build_backrun_tx(
         }
     };
 
+    // Use the router address from the actual Fynd quote transaction (fynd_tx.to()).
+    let fynd_router = AlloyAddress::from_slice(fynd_tx.to().as_ref());
     let params = SettleParams {
         order_fields: &raw_order,
         signature: &signature,
         extension: &extension,
         taking_amount,
-        router: backrunner.fynd_router,
+        router: fynd_router,
         primary_swap_calldata: fynd_tx.data(),
         surplus_calldata: &surplus_calldata,
         resolver_address: backrunner.resolver_address,
     };
+    let _ = surplus_router; // surplus always uses the same Fynd router as primary
     let settle_data = build_settle_calldata(&params);
 
     let raw_tx = RawTx {

@@ -55,12 +55,6 @@ struct Cli {
     )]
     resolver_address: AlloyAddress,
 
-    #[arg(
-        long, env = "FYND_ROUTER",
-        default_value = "0x1f8dB310f32D48B6180fF902EC60C586128cEf47"
-    )]
-    fynd_router: AlloyAddress,
-
     #[arg(long, env = "SLIPPAGE", default_value_t = 0.005)]
     slippage: f64,
 }
@@ -84,7 +78,6 @@ async fn main() -> Result<()> {
         ready_timeout: Duration::from_mins(3),
         chain_id: cli.chain_id,
         resolver_address: cli.resolver_address,
-        fynd_router: cli.fynd_router,
         slippage: cli.slippage,
     };
 
