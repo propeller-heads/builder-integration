@@ -38,14 +38,16 @@ const ORDERBOOK_WAIT_SECS: u64 = 15;
 /// Fynd/Tycho router on Ethereum mainnet.
 const FYND_ROUTER: AlloyAddress = address!("1f8dB310f32D48B6180fF902EC60C586128cEf47");
 
-/// 1inch Fusion KycNFT (ERC721) used as the whitelist fallback in Fusion v2 orders.
-/// Orders check: `if (!inlineWhitelist) require(kycNft.balanceOf(taker) > 0)`.
-/// We override `_balances[resolver] = 1` so any resolver passes the check.
-const KYC_NFT: AlloyAddress = address!("AccE550000863572B867E661647CD7D97b72C507");
-
-/// Synthetic address used when no `RESOLVER_ADDRESS` is set.
-/// The bytecode override makes deployment unnecessary.
-const VIRTUAL_RESOLVER: AlloyAddress = address!("0000000000000000000000000000000000001234");
+/// Synthetic resolver address whose lower 10 bytes match the standard 1inch Fusion
+/// resolver whitelist entries (`b09498030ae3416b66dc` = entry [0] in every active order).
+///
+/// Fusion v2 checks `uint80(uint160(taker)) == entry_low80`. By setting the lower
+/// 10 bytes of our virtual address to a known whitelisted value, the inline check
+/// passes without needing a KycNFT balance override.
+///
+/// Verified against live orders: all 6 whitelist entries share the same `allowFrom`
+/// (timeDelta=0) and use the same set of resolver lower-10-byte values across orders.
+const VIRTUAL_RESOLVER: AlloyAddress = address!("00000000000000000000b09498030ae3416b66dc");
 
 /// `BackrunResolver` runtime bytecode compiled from `contracts/src/BackrunResolver.sol`.
 /// Injected via state override on every `eth_call`, so no on-chain deployment is needed.
@@ -242,6 +244,9 @@ async fn run_block_loop(
                         let mut m = alloy::rpc::types::state::StateOverride::default();
 
                         // Inject resolver bytecode + grant EXECUTOR_ROLE to the caller.
+                        // The virtual resolver's lower 10 bytes match a whitelisted Fusion
+                        // resolver, so the inline whitelist check passes without any
+                        // additional overrides (no KycNFT balance needed).
                         m.insert(resolver_addr, AccountOverride {
                             code: Some(bytecode.clone()),
                             // OZ AccessControl layout (slot 0 = _roles mapping):
@@ -251,23 +256,6 @@ async fn run_block_loop(
                                 let mut diff = B256HashMap::default();
                                 diff.insert(
                                     executor_role_has_role_slot(resolver_addr),
-                                    B256::from(alloy::primitives::U256::from(1)),
-                                );
-                                diff
-                            }),
-                            ..Default::default()
-                        });
-
-                        // Grant the resolver a KycNFT balance so it passes the Fusion v2
-                        // resolver whitelist fallback check:
-                        //   if (!inlineWhitelist) require(kycNft.balanceOf(taker) > 0)
-                        // OZ ERC721 layout: _balances is mapping at slot 4.
-                        //   slot = keccak256(resolver_addr_padded || uint256(4))
-                        m.insert(KYC_NFT, AccountOverride {
-                            state_diff: Some({
-                                let mut diff = B256HashMap::default();
-                                diff.insert(
-                                    erc721_balances_slot(resolver_addr),
                                     B256::from(alloy::primitives::U256::from(1)),
                                 );
                                 diff
@@ -301,23 +289,6 @@ async fn run_block_loop(
             }
         }
     }
-}
-
-/// Computes the KycNFT `_balances[account]` storage slot.
-///
-/// KycNFT (0xAccE55...) inherits Ownable then ERC721, so storage is:
-///   slot 0 = Ownable._owner
-///   slot 1 = ERC721._name
-///   slot 2 = ERC721._symbol
-///   slot 3 = ERC721._owners   (tokenId → address)
-///   slot 4 = ERC721._balances (address → uint256)  ← confirmed empirically
-///
-/// slot = keccak256(account_padded_32bytes || uint256(4))
-fn erc721_balances_slot(account: AlloyAddress) -> B256 {
-    let mut buf = [0u8; 64];
-    buf[12..32].copy_from_slice(account.as_slice()); // address left-padded to 32 bytes
-    buf[63] = 4; // uint256(4) in big-endian
-    keccak256(&buf)
 }
 
 /// Computes the storage slot for `_roles[EXECUTOR_ROLE].hasRole[account]` in the
