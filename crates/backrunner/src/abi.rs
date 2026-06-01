@@ -6,13 +6,17 @@
 //!                 → `resolver.takerInteraction(order, ..., extraData)`
 //!                         → `fynd_router.call(swap_calldata)`
 //!
-//! `args` layout for `fillContractOrder`:
-//!   `[extension_bytes][resolver_address 20 bytes][extra_data bytes]`
+//! `args` layout for `fillContractOrderArgs` (from `TakerTraitsLib._parseArgs`):
+//!   `[target 20 bytes][extension extensionLen bytes][interaction interactionLen bytes]`
 //!
-//! `takerTraits` bits (1inch LOP v4):
-//!   bit 249 — `ARGS_HAS_TARGET`: interaction target address + data in args
-//!   bit 248 — `ARGS_HAS_EXTENSION`: Fusion extension bytes prepended to args
-//!   bits 0-79 — amount threshold (takingAmount from Dutch auction)
+//!   The LOP strips the target first (if `argsHasTarget()`), then reads
+//!   `extensionLen` and `interactionLen` from `takerTraits` bit fields.
+//!
+//! `takerTraits` bit layout (1inch LOP v4 `TakerTraitsLib`):
+//!   bit 251       — `ARGS_HAS_TARGET`: first 20 bytes of args are the interaction target
+//!   bits 224-247  — `argsExtensionLength`: how many bytes of args are Fusion extension
+//!   bits 200-223  — `argsInteractionLength`: how many bytes follow extension as interaction
+//!   bits 0-184    — amount threshold
 
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::sol;
@@ -49,10 +53,12 @@ sol! {
     }
 }
 
-/// Bit 251: args contains a 20-byte interaction target address + callback data.
+/// Bit 251: first 20 bytes of args are the takerInteraction target address.
 const ARGS_HAS_TARGET_BIT: u8 = 251;
-/// Bit 250: args starts with Fusion extension bytes.
-const ARGS_HAS_EXTENSION_BIT: u8 = 250;
+/// Bits 224-247: 24-bit field encoding the extension byte length in args.
+const ARGS_EXTENSION_LENGTH_OFFSET: u8 = 224;
+/// Bits 200-223: 24-bit field encoding the interaction byte length in args.
+const ARGS_INTERACTION_LENGTH_OFFSET: u8 = 200;
 
 /// Decoded order fields in U256 form (matching 1inch LOP v4's packed Address type).
 pub struct RawOrderFields {
@@ -99,18 +105,19 @@ pub fn build_settle_calldata(p: &SettleParams<'_>) -> Bytes {
     )
         .abi_encode();
 
-    // ── args = extension ++ resolver_address(20 bytes) ++ extra_data ────────
-    let mut args = Vec::with_capacity(p.extension.len() + 20 + extra_data.len());
+    // ── args = resolver_address(20B) ++ extension ++ extra_data(interaction) ─
+    // LOP._parseArgs strips target first, then reads extensionLength/interactionLength
+    // bytes from takerTraits bit fields.
+    let mut args = Vec::with_capacity(20 + p.extension.len() + extra_data.len());
+    args.extend_from_slice(p.resolver_address.as_slice()); // target stripped first by LOP
     args.extend_from_slice(p.extension);
-    args.extend_from_slice(p.resolver_address.as_slice());
     args.extend_from_slice(&extra_data);
 
     // ── takerTraits ─────────────────────────────────────────────────────────
-    let mut taker_traits = U256::from(p.taking_amount); // lower bits = threshold
-    if !p.extension.is_empty() {
-        taker_traits |= U256::from(1u64) << ARGS_HAS_EXTENSION_BIT;
-    }
+    let mut taker_traits = U256::from(p.taking_amount); // bits 0-184 = threshold
     taker_traits |= U256::from(1u64) << ARGS_HAS_TARGET_BIT;
+    taker_traits |= U256::from(p.extension.len() as u64) << ARGS_EXTENSION_LENGTH_OFFSET;
+    taker_traits |= U256::from(extra_data.len() as u64) << ARGS_INTERACTION_LENGTH_OFFSET;
 
     // ── fillContractOrder calldata ───────────────────────────────────────────
     let order = IOrderMixin::Order {
