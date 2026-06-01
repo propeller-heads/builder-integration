@@ -395,24 +395,47 @@ async fn build_backrun_tx(
     fynd_tx: &fynd_core::Transaction,
 ) -> Option<BackrunTx> {
     let BackrunContext { uuid, block_ts, base_fee, block_number, solve_time_ms, orders_quoted, backrunner } = ctx;
+    // NOTE: gas bump not applied. The 1inch contract computes:
+    //   final_rate = max(0, auction_bump - gas_bump)
+    //   gas_bump   = gasBumpEstimate × currentBaseFee / gasPriceEstimate / 1_000_000
+    // Both gasBumpEstimate and gasPriceEstimate are encoded in the order extension bytes (not
+    // exposed by the 1inch API response). Not subtracting gas_bump means our taking_amount is
+    // systematically higher than what the contract requires — we filter out orders that would
+    // actually succeed. Fix: decode gas cost params from extension bytes + pass base_fee_per_gas.
     let taking_amount = amount_at_timestamp(fusion_order, *block_ts)?;
 
-    // Check that the Fynd swap output is at least the auction's required taking amount.
-    let digits = order_quote.amount_out().to_u64_digits();
-    if digits.is_empty() {
+    // Check that the Fynd swap output (after router fee) is at least the auction's taking amount.
+    // amount_out() is the gross pool output; the Fynd router deducts router_fee before the
+    // resolver receives the tokens. Use the fee_breakdown when available (always present when
+    // EncodingOptions are set), falling back to gross amount_out only when encoding was skipped.
+    let biguint_to_u128 = |b: &BigUint| {
+        let digits = b.to_u64_digits();
+        if digits.is_empty() {
+            0u128
+        } else if digits.len() > 2 {
+            u128::MAX
+        } else {
+            digits.iter().enumerate().fold(0u128, |acc, (i, &d)| acc | (u128::from(d) << (i * 64)))
+        }
+    };
+
+    let amount_out_gross = biguint_to_u128(order_quote.amount_out());
+    if amount_out_gross == 0 {
         return None;
     }
-    let amount_out_u128 = if digits.len() > 2 {
-        u128::MAX // overflow guard: treat as very profitable
+
+    // Net amount after Fynd router fee; surplus is computed against this.
+    let amount_out_u128 = if let Some(fb) = order_quote.fee_breakdown() {
+        let router_fee = biguint_to_u128(fb.router_fee());
+        amount_out_gross.saturating_sub(router_fee)
     } else {
-        digits
-            .iter()
-            .enumerate()
-            .fold(0u128, |acc, (i, &d)| acc | (u128::from(d) << (i * 64)))
+        amount_out_gross
     };
 
     if amount_out_u128 < taking_amount {
-        debug!(%uuid, order_id = %fusion_order.order_id, "swap output below auction price, skipping");
+        debug!(%uuid, order_id = %fusion_order.order_id,
+            amount_out_gross, amount_out_net = amount_out_u128, taking_amount,
+            "swap output below auction price after fee, skipping");
         return None;
     }
 
@@ -499,7 +522,8 @@ async fn build_backrun_tx(
         solve_time_ms,
         orders_quoted,
         taking_amount,
-        amount_out = amount_out_u128,
+        amount_out_gross,
+        amount_out_net = amount_out_u128,
         surplus = surplus_amount,
         "backrun candidate built",
     );

@@ -22,14 +22,14 @@ fn known_decimals(address_lower: &str) -> Option<u8> {
     }
 }
 
-/// Computes `base * (1 + bump / RATE_BUMP_DIVISOR)` using integer arithmetic with rounding.
+/// Computes `base * (1 + bump / RATE_BUMP_DIVISOR)` using ceiling integer arithmetic.
 ///
-/// Uses `saturating_mul` for extreme inputs; real token amounts fit well within the safe range
-/// (`base ≤ 10^30`, `bump ≤ 10^7`, product ≤ 10^37 well below `u128::MAX`).
+/// Matches the on-chain `calcAuctionTakingAmount` which uses `mulDiv(..., Ceil)`.
+/// Ceiling: add `RATE_BUMP_DIVISOR - 1` before truncating division.
 fn apply_rate_bump(base: u128, bump: u128) -> u128 {
     let increment = base
         .saturating_mul(bump)
-        .saturating_add(RATE_BUMP_DIVISOR / 2)
+        .saturating_add(RATE_BUMP_DIVISOR - 1)
         / RATE_BUMP_DIVISOR;
     base.saturating_add(increment)
 }

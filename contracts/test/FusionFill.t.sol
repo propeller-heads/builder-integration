@@ -24,9 +24,11 @@ contract FusionFillTest is Test {
     /// @dev End-to-end: reads fixture from Rust encode test, calls LOP.
     ///
     ///   ok = true             → fill succeeded
-    ///   InsufficientOutput    → encoding correct; Fynd router fee (~0.12%) reduces
-    ///                           output below the LOP's auction price. Off-chain
-    ///                           profitability check does not deduct this fee yet.
+    ///   InsufficientOutput    → encoding correct; Fynd router fee reduces output below
+    ///                           LOP auction price. Off-chain check does not deduct this yet.
+    ///   TakingAmountTooHigh   → encoding correct; fill targets a future block timestamp
+    ///                           (more decayed = lower taking threshold), but the fork runs
+    ///                           at an earlier block where the auction price is still higher.
     ///   MissingOrderExtension → BUG: takerTraits extensionLength field is zero
     ///   InvalidExtensionHash  → BUG: wrong extension bytes
     function test_encodedFill() public {
@@ -39,13 +41,18 @@ contract FusionFillTest is Test {
         (bool ok, bytes memory reason) = LOP.call(inner);
         bytes4 sel = bytes4(reason);
 
-        if (ok)              console2.log("FILL SUCCESS");
+        if (ok)                    console2.log("FILL SUCCESS");
         else if (sel == 0x2c19b8b8) console2.log("InsufficientOutput (encoding correct, router fee gap)");
-        else                 console2.log("Unexpected revert:", vm.toString(sel));
+        else if (sel == 0xfb8ae129) console2.log("TakingAmountTooHigh (encoding correct, fork is before target block)");
+        else                        console2.log("Unexpected revert:", vm.toString(sel));
 
-        assertTrue(ok || sel == bytes4(0x2c19b8b8), "got an encoding-level error, not a price error");
+        assertTrue(
+            ok || sel == bytes4(0x2c19b8b8) || sel == bytes4(0xfb8ae129),
+            "got an encoding-level error, not a price error"
+        );
         assertNotEq(sel, bytes4(0xb2d25e49), "MissingOrderExtension = takerTraits extensionLength=0");
         assertNotEq(sel, bytes4(0xdc11ee6b), "InvalidExtensionHash  = wrong extension bytes");
+        assertNotEq(sel, bytes4(0x481ea392), "MakingAmountTooLow = MAKER_AMOUNT_FLAG not set");
     }
 
     /// @dev Regression: the pre-fix (broken) encoding must produce MissingOrderExtension.

@@ -24,6 +24,8 @@ use alloy::sol_types::SolCall;
 use alloy::sol_types::SolValue;
 
 // 1inch LOP v4 uses a packed `Address` type (uint256) for all address fields.
+// Field order matches the deployed LOP v4 (0x111111125421cA6dc452d289314280a0f8842A65):
+//   salt, maker, receiver, makerAsset, takerAsset, makingAmount, takingAmount, makerTraits
 sol! {
     interface IOrderMixin {
         struct Order {
@@ -65,6 +67,12 @@ sol! {
     }
 }
 
+/// Bit 255: amount parameter is in maker token units (not taker).
+/// With this flag: `amount` = full makingAmount; threshold (bits 0-184) = max taking the taker
+/// will pay. LOP reverts `TakingAmountTooHigh` if the Dutch auction price exceeds threshold.
+/// Without this flag: `amount` = taking amount; threshold = min making amount the taker accepts.
+/// We always set this flag so we fill the complete order and cap our taker spend.
+const MAKER_AMOUNT_FLAG: u8 = 255;
 /// Bit 251: first 20 bytes of args are the takerInteraction target address.
 const ARGS_HAS_TARGET_BIT: u8 = 251;
 /// Bits 224-247: 24-bit field encoding the extension byte length in args.
@@ -139,7 +147,11 @@ pub fn build_settle_calldata(p: &SettleParams<'_>) -> Bytes {
     args.extend_from_slice(&interaction);
 
     // ── takerTraits ─────────────────────────────────────────────────────────
-    let mut taker_traits = U256::from(p.taking_amount); // bits 0-184 = threshold
+    // MAKER_AMOUNT_FLAG (bit 255): `amount` param is in maker token; threshold = max taking.
+    // Without this flag the LOP treats `amount` as taker token, which would cause
+    // MakingAmountTooLow when `amount = making_amount` has the wrong decimal scale.
+    let mut taker_traits = U256::from(p.taking_amount); // bits 0-184 = max taking threshold
+    taker_traits |= U256::from(1u64) << MAKER_AMOUNT_FLAG;
     taker_traits |= U256::from(1u64) << ARGS_HAS_TARGET_BIT;
     taker_traits |= U256::from(p.extension.len() as u64) << ARGS_EXTENSION_LENGTH_OFFSET;
     taker_traits |= U256::from(interaction.len() as u64) << ARGS_INTERACTION_LENGTH_OFFSET;
