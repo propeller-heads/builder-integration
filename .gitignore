@@ -1,2 +1,4 @@
 /target/
 .idea/
+librust_out.rlib
+libtest_expect.rlib
