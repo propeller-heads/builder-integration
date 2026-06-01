@@ -23,8 +23,11 @@
 use std::{collections::HashMap, env, time::Duration};
 
 use alloy::primitives::{address, keccak256, map::B256HashMap, Address as AlloyAddress, Bytes as AlloyBytes, B256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::{ext::DebugApi, Provider, ProviderBuilder};
 use alloy::rpc::types::state::AccountOverride;
+use alloy::rpc::types::trace::geth::{
+    GethDebugBuiltInTracerType, GethDebugTracingCallOptions, GethDebugTracingOptions,
+};
 use anyhow::{Context, Result};
 use backrunner::{Backrunner, BackrunnerConfig};
 use builder_types::{BackrunCandidate, BlockEnv, BuildEvent, PostState};
@@ -179,7 +182,9 @@ async fn run_block_loop(
             }
         };
 
-        let MarketEvent::MarketUpdated { .. } = event;
+        if !matches!(event, MarketEvent::MarketUpdated { .. }) {
+            continue;
+        }
 
         let Some(confirmed) = read_confirmed_block_info(&market_data) else {
             tracing::debug!("confirmed block not yet in market data; skipping");
@@ -228,67 +233,92 @@ async fn run_block_loop(
                 tracing::info!(block_number, "iteration result: empty candidate");
             }
             Some(c) => {
-                tracing::info!(
-                    block_number,
-                    txs = c.txs.len(),
-                    "candidate found — validating via eth_call with bytecode override"
-                );
-                for (i, backrun_tx) in c.txs.iter().enumerate() {
-                    let tx_req = alloy::rpc::types::TransactionRequest::default()
-                        .from(resolver_addr)
-                        .to(backrun_tx.tx.to.unwrap_or_default())
-                        .value(backrun_tx.tx.value)
-                        .input(backrun_tx.tx.data.clone().into());
+                tracing::info!(block_number, txs = c.txs.len(),
+                    "candidate found — validating via eth_call with bytecode override");
+                validate_candidate_txs(&c.txs, block_number, &provider, resolver_addr, &resolver_bytecode).await;
+            }
+        }
+    }
+}
 
-                    let state_override = resolver_bytecode.as_ref().map(|bytecode| {
-                        let mut m = alloy::rpc::types::state::StateOverride::default();
+/// Runs `eth_call` for each tx in a candidate and traces the first revert.
+async fn validate_candidate_txs(
+    txs: &[builder_types::BackrunTx],
+    block_number: u64,
+    provider: &impl Provider,
+    resolver_addr: AlloyAddress,
+    resolver_bytecode: &Option<AlloyBytes>,
+) {
+    for (i, backrun_tx) in txs.iter().enumerate() {
+        let calldata = backrun_tx.tx.data.clone();
+        tracing::info!(block_number, tx_index = i,
+            calldata_hex = %alloy::primitives::hex::encode(&calldata), "eth_call calldata");
 
-                        // Inject resolver bytecode + grant EXECUTOR_ROLE to the caller.
-                        // The virtual resolver's lower 10 bytes match a whitelisted Fusion
-                        // resolver, so the inline whitelist check passes without any
-                        // additional overrides (no KycNFT balance needed).
-                        m.insert(resolver_addr, AccountOverride {
-                            code: Some(bytecode.clone()),
-                            // OZ AccessControl layout (slot 0 = _roles mapping):
-                            //   _roles[EXECUTOR_ROLE].hasRole[caller]
-                            //   = keccak256(caller || keccak256(EXECUTOR_ROLE || 0))
-                            state_diff: Some({
-                                let mut diff = B256HashMap::default();
-                                diff.insert(
-                                    executor_role_has_role_slot(resolver_addr),
-                                    B256::from(alloy::primitives::U256::from(1)),
-                                );
-                                diff
-                            }),
-                            ..Default::default()
-                        });
+        let tx_req = alloy::rpc::types::TransactionRequest::default()
+            .from(resolver_addr)
+            .to(backrun_tx.tx.to.unwrap_or_default())
+            .value(backrun_tx.tx.value)
+            .input(calldata.into());
 
-                        m
-                    });
-                    let result = provider.call(tx_req).overrides_opt(state_override).await;
-
-                    match result {
-                        Ok(output) => {
-                            tracing::info!(
-                                block_number,
-                                tx_index = i,
-                                output_bytes = output.len(),
-                                "eth_call SUCCESS ✓"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                block_number,
-                                tx_index = i,
-                                error = %e,
-                                "eth_call REVERTED"
-                            );
-                        }
-                    }
+        let state_override = build_state_override(resolver_addr, resolver_bytecode);
+        match provider.call(tx_req).overrides_opt(state_override).await {
+            Ok(output) => tracing::info!(block_number, tx_index = i,
+                output_bytes = output.len(), "eth_call SUCCESS ✓"),
+            Err(e) => {
+                tracing::warn!(block_number, tx_index = i, error = %e, "eth_call REVERTED");
+                if i == 0 {
+                    trace_call(backrun_tx, block_number, provider, resolver_addr, resolver_bytecode).await;
                 }
             }
         }
     }
+}
+
+/// Issues `debug_traceCall` and logs the result to understand where a fill reverts.
+async fn trace_call(
+    backrun_tx: &builder_types::BackrunTx,
+    block_number: u64,
+    provider: &impl Provider,
+    resolver_addr: AlloyAddress,
+    resolver_bytecode: &Option<AlloyBytes>,
+) {
+    let tx_req = alloy::rpc::types::TransactionRequest::default()
+        .from(resolver_addr)
+        .to(backrun_tx.tx.to.unwrap_or_default())
+        .value(backrun_tx.tx.value)
+        .input(backrun_tx.tx.data.clone().into());
+    let mut opts = GethDebugTracingCallOptions::new(GethDebugTracingOptions {
+        tracer: Some(alloy::rpc::types::trace::geth::GethDebugTracerType::BuiltInTracer(
+            GethDebugBuiltInTracerType::CallTracer,
+        )),
+        ..Default::default()
+    });
+    opts.state_overrides = build_state_override(resolver_addr, resolver_bytecode);
+    match provider.debug_trace_call(tx_req, alloy::rpc::types::BlockId::latest(), opts).await {
+        Ok(trace) => tracing::info!(block_number, trace = ?trace, "debug_trace_call result"),
+        Err(e) => tracing::warn!(block_number, error = %e, "trace failed"),
+    }
+}
+
+/// Builds the state override map: injects resolver bytecode + grants `EXECUTOR_ROLE`.
+fn build_state_override(
+    resolver_addr: AlloyAddress,
+    resolver_bytecode: &Option<AlloyBytes>,
+) -> Option<alloy::rpc::types::state::StateOverride> {
+    resolver_bytecode.as_ref().map(|bytecode| {
+        let mut m = alloy::rpc::types::state::StateOverride::default();
+        let mut diff = B256HashMap::default();
+        diff.insert(
+            executor_role_has_role_slot(resolver_addr),
+            B256::from(alloy::primitives::U256::from(1)),
+        );
+        m.insert(resolver_addr, AccountOverride {
+            code: Some(bytecode.clone()),
+            state_diff: Some(diff),
+            ..Default::default()
+        });
+        m
+    })
 }
 
 /// Computes the storage slot for `_roles[EXECUTOR_ROLE].hasRole[account]` in the
