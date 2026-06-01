@@ -37,11 +37,22 @@ sol! {
             uint256 makerTraits;
         }
 
-        // The args-bearing variant of fillContractOrder; selector 0x56a75868.
-        // The 4-param `fillContractOrder` (no args, 0xcc713a04) is a separate function.
+        // Selector 0x56a75868: taker is a contract, maker is ERC-1271 (smart contract).
+        // LOP calls maker.isValidSignature(hash, sig) for validation.
         function fillContractOrderArgs(
             Order calldata order,
             bytes calldata signature,
+            uint256 amount,
+            uint256 takerTraits,
+            bytes calldata args
+        ) external payable returns (uint256, uint256, bytes32);
+
+        // Selector 0xf497df75: taker is a contract, maker is an EOA.
+        // LOP uses ecrecover(hash, r, s, v) where v comes from makerTraits bit 247.
+        function fillOrderArgs(
+            Order calldata order,
+            bytes32 r,
+            bytes32 s,
             uint256 amount,
             uint256 takerTraits,
             bytes calldata args
@@ -119,7 +130,7 @@ pub fn build_settle_calldata(p: &SettleParams<'_>) -> Bytes {
     taker_traits |= U256::from(p.extension.len() as u64) << ARGS_EXTENSION_LENGTH_OFFSET;
     taker_traits |= U256::from(extra_data.len() as u64) << ARGS_INTERACTION_LENGTH_OFFSET;
 
-    // ── fillContractOrder calldata ───────────────────────────────────────────
+    // ── fill calldata: EOA makers use fillOrderArgs, ERC-1271 makers use fillContractOrderArgs
     let order = IOrderMixin::Order {
         salt: p.order_fields.salt,
         maker: p.order_fields.maker,
@@ -131,14 +142,33 @@ pub fn build_settle_calldata(p: &SettleParams<'_>) -> Bytes {
         makerTraits: p.order_fields.maker_traits,
     };
 
-    let fill_call = IOrderMixin::fillContractOrderArgsCall {
-        order,
-        signature: Bytes::copy_from_slice(p.signature),
-        amount: p.order_fields.making_amount, // full fill
-        takerTraits: taker_traits,
-        args: Bytes::from(args),
+    let fill_calldata = if p.signature.len() == 65 {
+        // EOA-signed order: use fillOrderArgs (ecrecover path).
+        // r = sig[0..32], s = sig[32..64]; v (sig[64]) is encoded in makerTraits bit 247.
+        let mut r = [0u8; 32];
+        let mut s = [0u8; 32];
+        r.copy_from_slice(&p.signature[..32]);
+        s.copy_from_slice(&p.signature[32..64]);
+        IOrderMixin::fillOrderArgsCall {
+            order,
+            r: r.into(),
+            s: s.into(),
+            amount: p.order_fields.making_amount,
+            takerTraits: taker_traits,
+            args: Bytes::from(args),
+        }
+        .abi_encode()
+    } else {
+        // ERC-1271 maker: use fillContractOrderArgs (isValidSignature path).
+        IOrderMixin::fillContractOrderArgsCall {
+            order,
+            signature: Bytes::copy_from_slice(p.signature),
+            amount: p.order_fields.making_amount,
+            takerTraits: taker_traits,
+            args: Bytes::from(args),
+        }
+        .abi_encode()
     };
-    let fill_calldata = fill_call.abi_encode();
 
     // ── settleOrders wrapper ─────────────────────────────────────────────────
     let settle_call = IBackrunResolver::settleOrdersCall {
