@@ -33,7 +33,9 @@ sol! {
             uint256 makerTraits;
         }
 
-        function fillContractOrder(
+        // The args-bearing variant of fillContractOrder; selector 0x56a75868.
+        // The 4-param `fillContractOrder` (no args, 0xcc713a04) is a separate function.
+        function fillContractOrderArgs(
             Order calldata order,
             bytes calldata signature,
             uint256 amount,
@@ -122,7 +124,7 @@ pub fn build_settle_calldata(p: &SettleParams<'_>) -> Bytes {
         makerTraits: p.order_fields.maker_traits,
     };
 
-    let fill_call = IOrderMixin::fillContractOrderCall {
+    let fill_call = IOrderMixin::fillContractOrderArgsCall {
         order,
         signature: Bytes::copy_from_slice(p.signature),
         amount: p.order_fields.making_amount, // full fill
