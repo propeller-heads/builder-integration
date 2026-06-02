@@ -182,16 +182,35 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
 
     let auction_start_amount = apply_rate_bump(taking_amount, eff_initial_rate_bump);
 
-    let mut cumulative_delay: u64 = 0;
-    let mut points = Vec::with_capacity(item.points.len());
-    for p in item.points {
-        cumulative_delay += p.delay;
-        if cumulative_delay >= auction_duration_secs {
-            break;
+    // Prefer extension-decoded points: the 1inch API frequently returns empty points
+    // for orders that DO have extension breakpoints, causing systematic underestimation.
+    // Extension delays are already cumulative from auction start; API delays are relative.
+    let points: Vec<AuctionPoint> = if let Some(ext) = ext_params.as_ref().filter(|e| !e.points.is_empty()) {
+        ext
+            .points
+            .iter()
+            .filter(|&&(_, d)| u64::from(d) <= auction_duration_secs)
+            .map(|&(coeff, delay)| AuctionPoint {
+                delay_secs: u64::from(delay),
+                amount: apply_rate_bump(taking_amount, u128::from(coeff)),
+            })
+            .collect()
+    } else {
+        // Fall back to API points (relative delays, need accumulation).
+        let mut cum: u64 = 0;
+        let mut pts = Vec::with_capacity(item.points.len());
+        for p in &item.points {
+            cum += p.delay;
+            if cum >= auction_duration_secs {
+                break;
+            }
+            pts.push(AuctionPoint {
+                delay_secs: cum,
+                amount: apply_rate_bump(taking_amount, p.coefficient),
+            });
         }
-        let amount = apply_rate_bump(taking_amount, p.coefficient);
-        points.push(AuctionPoint { delay_secs: cumulative_delay, amount });
-    }
+        pts
+    };
 
     let from_addr = item.order.maker_asset.to_lowercase();
     let to_addr = item.order.taker_asset.to_lowercase();
@@ -238,6 +257,11 @@ struct ExtensionParams {
     init_rate_bump: u32,
     gas_bump_estimate: u32,
     gas_price_estimate_mwei: u32,
+    /// Auction breakpoints: `(coefficient, cumulative_delay_secs)`.
+    ///
+    /// Delays are cumulative from `start_time` (not relative between consecutive points).
+    /// Amounts are derived via `apply_rate_bump(floor, coefficient)` in `convert()`.
+    points: Vec<(u32, u16)>,
 }
 
 /// Decodes auction parameters from a 1inch Fusion extension hex string.
@@ -251,6 +275,8 @@ struct ExtensionParams {
 ///   [59:63]  startTime        (uint32)  → hex chars [118:126]
 ///   [63:66]  duration         (uint24)  → hex chars [126:132]
 ///   [66:69]  initialRateBump  (uint24)  → hex chars [132:138]
+///   [69]     point count      (uint8)   → hex chars [138:140]
+///   [70+]    N × (coeff uint24 + delay uint16) → hex chars [140 + N×10]
 fn decode_extension_params(extension_hex: &str) -> Option<ExtensionParams> {
     let raw = extension_hex.strip_prefix("0x").unwrap_or(extension_hex);
     if raw.len() < 138 {
@@ -262,9 +288,88 @@ fn decode_extension_params(extension_hex: &str) -> Option<ExtensionParams> {
     let duration                = u64::from_str_radix(&raw[126..132], 16).ok()?;
     let init_rate_bump          = u32::from_str_radix(&raw[132..138], 16).ok()?;
     if duration == 0 {
-        None
+        return None;
+    }
+
+    // Parse auction breakpoints when present.
+    // Each point: 6 hex chars (coeff uint24) + 4 hex chars (delay uint16) = 10 chars.
+    let points = if raw.len() >= 140 {
+        let count = usize::from(u8::from_str_radix(&raw[138..140], 16).unwrap_or(0));
+        let mut pts = Vec::with_capacity(count);
+        for i in 0..count {
+            let base = 140 + i * 10;
+            if raw.len() < base + 10 {
+                break;
+            }
+            let Ok(coeff) = u32::from_str_radix(&raw[base..base + 6], 16) else {
+                break;
+            };
+            let Ok(delay) = u16::from_str_radix(&raw[base + 6..base + 10], 16) else {
+                break;
+            };
+            pts.push((coeff, delay));
+        }
+        pts
     } else {
-        Some(ExtensionParams { start_time, duration, init_rate_bump, gas_bump_estimate, gas_price_estimate_mwei })
+        Vec::new()
+    };
+
+    Some(ExtensionParams {
+        start_time,
+        duration,
+        init_rate_bump,
+        gas_bump_estimate,
+        gas_price_estimate_mwei,
+        points,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_extension_params_parses_two_points() {
+        // Synthetic extension: 32-byte LOP header + 20-byte address + fixed fields + 2 points.
+        let ext = concat!(
+            "0x",
+            "0000000000000000000000000000000000000000000000000000000000000000", // LOP header
+            "0000000000000000000000000000000000000000",                         // address
+            "000001",   // gasBumpEstimate  = 1
+            "00000001", // gasPriceEstimate = 1 Mwei
+            "00000064", // startTime        = 100
+            "000064",   // duration         = 100 s
+            "000001",   // initialRateBump  = 1
+            "02",           // 2 points
+            "000100000A",   // coeff=256, delay=10 (cumulative)
+            "0000800064",   // coeff=128, delay=100 (cumulative)
+        );
+        let p = decode_extension_params(ext).expect("should decode");
+        assert_eq!(p.start_time, 100);
+        assert_eq!(p.duration, 100);
+        assert_eq!(p.init_rate_bump, 1);
+        assert_eq!(p.gas_bump_estimate, 1);
+        assert_eq!(p.gas_price_estimate_mwei, 1);
+        assert_eq!(p.points, vec![(256, 10), (128, 100)]);
+    }
+
+    #[test]
+    fn decode_extension_params_zero_points() {
+        let ext = concat!(
+            "0x",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000",
+            "000001", "00000001", "00000064", "000064", "000001",
+            "00", // 0 points
+        );
+        let p = decode_extension_params(ext).expect("should decode");
+        assert!(p.points.is_empty());
+    }
+
+    #[test]
+    fn decode_extension_params_too_short_returns_none() {
+        assert!(decode_extension_params("0x00").is_none());
+        assert!(decode_extension_params("0x").is_none());
     }
 }
 
