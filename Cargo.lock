@@ -1683,6 +1683,7 @@ dependencies = [
  "builder-types",
  "chrono",
  "clap",
+ "futures 0.3.32",
  "fynd-core",
  "hex",
  "num-bigint",

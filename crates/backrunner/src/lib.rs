@@ -516,13 +516,20 @@ async fn build_backrun_tx(
         "auction price estimate",
     );
 
-    // Minimum headroom above the API-derived price estimate (covers duration-mismatch error).
-    // With the extension-duration fix in client.rs, the duration-mismatch error is eliminated.
-    // The remaining residual (~21 bps at block 25229002) comes from auction-breakpoint
-    // differences between the API's `points` array and the on-chain extension encoding.
-    // 30 bps provides a 9 bps buffer above this residual, filtering genuinely unprofitable
-    // orders while allowing marginal winners through.
-    const MIN_PROFIT_MARGIN_BPS: u128 = 30; // 0.30%
+    // Minimum headroom above the price estimate before issuing eth_call.
+    //
+    // Root causes that justified a margin are now fixed:
+    //  - Duration mismatch: eliminated by reading start_time/duration from extension bytes.
+    //  - Breakpoint residual: only relevant for orders with points; current live orders have 0.
+    //  - Gas-bump: accounted for explicitly via compute_gas_bump + actual confirmed baseFee.
+    //
+    // Smoke test: the profitability estimate and the eth_call both use the same confirmed
+    // block's baseFee and timestamp, so on-chain price ≈ our estimate.  Any Fynd surplus
+    // above the estimate becomes profit — no extra margin needed.
+    //
+    // Production note: pending-block baseFee may differ from confirmed.  Add a small margin
+    // (e.g. 10 bps) if fill-time baseFee spikes cause frequent TakingAmountTooHigh reverts.
+    const MIN_PROFIT_MARGIN_BPS: u128 = 0;
 
     // Check that the Fynd swap output is above the auction price with required margin.
     let biguint_to_u128 = |b: &BigUint| {
