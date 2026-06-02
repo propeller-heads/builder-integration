@@ -41,7 +41,7 @@ pub struct FusionOrder {
     pub to_token_usd_rate: f64,
     /// Extension gasBumpEstimate (uint24): factor to multiply by baseFee/gasPriceEst.
     ///
-    /// On-chain: gasBump = gasBumpEstimate × baseFee_wei / (gasPriceEstimate × 10^6).
+    /// On-chain: gasBump = gasBumpEstimate × `baseFee_wei` / (gasPriceEstimate × 10^6).
     /// Included in the taking-amount computation so the profitability check is accurate.
     pub gas_bump_estimate: u32,
     /// Extension gasPriceEstimate (uint32) in units of 10^6 wei (Mwei).

@@ -173,13 +173,12 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
     //   [126:132] duration         (uint24)  ← 180 s for typical orders
     //   [132:138] initialRateBump  (uint24)
     let ext_params = decode_extension_params(&item.extension);
-    let auction_start_ts = ext_params.as_ref().map(|p| p.start_time).unwrap_or(auction_start_ts);
-    let auction_duration_secs = ext_params.as_ref().map(|p| p.duration).unwrap_or(api_duration_secs);
+    let auction_start_ts = ext_params.as_ref().map_or(auction_start_ts, |p| p.start_time);
+    let auction_duration_secs = ext_params.as_ref().map_or(api_duration_secs, |p| p.duration);
     let eff_initial_rate_bump = ext_params.as_ref()
-        .map(|p| u128::from(p.init_rate_bump))
-        .unwrap_or_else(|| u128::from(item.initial_rate_bump));
-    let gas_bump_estimate       = ext_params.as_ref().map(|p| p.gas_bump_estimate).unwrap_or(0);
-    let gas_price_estimate_mwei = ext_params.as_ref().map(|p| p.gas_price_estimate_mwei).unwrap_or(0);
+        .map_or_else(|| u128::from(item.initial_rate_bump), |p| u128::from(p.init_rate_bump));
+    let gas_bump_estimate       = ext_params.as_ref().map_or(0, |p| p.gas_bump_estimate);
+    let gas_price_estimate_mwei = ext_params.as_ref().map_or(0, |p| p.gas_price_estimate_mwei);
 
     let auction_start_amount = apply_rate_bump(taking_amount, eff_initial_rate_bump);
 

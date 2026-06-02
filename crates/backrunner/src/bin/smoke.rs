@@ -44,7 +44,7 @@ const ORDERBOOK_WAIT_SECS: u64 = 15;
 ///
 /// Fusion v2 checks `uint80(uint160(taker)) == entry_low80`. By setting the lower
 /// 10 bytes of our virtual address to a known whitelisted value, the inline check
-/// passes without needing a KycNFT balance override.
+/// passes without needing a `KycNFT` balance override.
 ///
 /// Verified against live orders: all 6 whitelist entries share the same `allowFrom`
 /// (timeDelta=0) and use the same set of resolver lower-10-byte values across orders.
@@ -65,7 +65,7 @@ const RESOLVER_BYTECODE_HEX: &str =
 ///   bits 0-7:  isSet flag (non-zero = client override active; 0 = use global default of 10 bps)
 ///   bits 8-23: client fee in bps
 /// We override slot `keccak256(abi.encode(resolver_addr, 2))` to `0x01` (isSet=true, fee=0 bps)
-/// so the eth_call simulation sees 0 fee, matching what the Fynd team will configure on-chain.
+/// so the `eth_call` simulation sees 0 fee, matching what the Fynd team will configure on-chain.
 const FEE_CALCULATOR: AlloyAddress = address!("24AD1d4a2666a99Ef46adA68999a89E324CD914C");
 
 #[tokio::main]
@@ -92,23 +92,20 @@ async fn main() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .filter(|a: &AlloyAddress| !a.is_zero());
 
-    let (resolver_addr, resolver_bytecode) = match deployed_addr {
-        Some(addr) => {
-            tracing::info!(%addr, "using deployed resolver (no bytecode override)");
-            (addr, None)
-        }
-        None => {
-            let bytecode: AlloyBytes = RESOLVER_BYTECODE_HEX
-                .trim()
-                .parse()
-                .context("embedded resolver bytecode is not valid hex")?;
-            tracing::info!(
-                addr = %VIRTUAL_RESOLVER,
-                bytecode_bytes = bytecode.len(),
-                "no RESOLVER_ADDRESS set — using virtual address with bytecode override"
-            );
-            (VIRTUAL_RESOLVER, Some(bytecode))
-        }
+    let (resolver_addr, resolver_bytecode) = if let Some(addr) = deployed_addr {
+        tracing::info!(%addr, "using deployed resolver (no bytecode override)");
+        (addr, None)
+    } else {
+        let bytecode: AlloyBytes = RESOLVER_BYTECODE_HEX
+            .trim()
+            .parse()
+            .context("embedded resolver bytecode is not valid hex")?;
+        tracing::info!(
+            addr = %VIRTUAL_RESOLVER,
+            bytecode_bytes = bytecode.len(),
+            "no RESOLVER_ADDRESS set — using virtual address with bytecode override"
+        );
+        (VIRTUAL_RESOLVER, Some(bytecode))
     };
 
     let chain_id: u64 = env::var("CHAIN_ID")
@@ -247,7 +244,7 @@ async fn run_block_loop(
             Some(c) => {
                 tracing::info!(block_number, txs = c.txs.len(),
                     "candidate found — validating via eth_call with bytecode override");
-                validate_candidate_txs(&c.txs, block_number, block_timestamp, base_fee_per_gas, &provider, resolver_addr, &resolver_bytecode).await;
+                validate_candidate_txs(&c.txs, block_number, block_timestamp, base_fee_per_gas, &provider, resolver_addr, resolver_bytecode.as_ref()).await;
             }
         }
     }
@@ -262,7 +259,7 @@ async fn validate_candidate_txs(
     base_fee_wei: u64,
     provider: &impl Provider,
     resolver_addr: AlloyAddress,
-    resolver_bytecode: &Option<AlloyBytes>,
+    resolver_bytecode: Option<&AlloyBytes>,
 ) {
     // Override both the block timestamp (for auction timing) and baseFee (for gasBump
     // computation). Using the same baseFee that was used in the profitability estimate
@@ -284,9 +281,8 @@ async fn validate_candidate_txs(
             .value(backrun_tx.tx.value)
             .input(calldata.into());
 
-        let state_override = build_state_override(resolver_addr, resolver_bytecode);
         match provider.call(tx_req)
-            .overrides_opt(state_override)
+            .overrides_opt(Some(build_state_override(resolver_addr, resolver_bytecode)))
             .with_block_overrides(block_overrides.clone())
             .await
         {
@@ -310,7 +306,7 @@ async fn trace_call(
     base_fee_wei: u64,
     provider: &impl Provider,
     resolver_addr: AlloyAddress,
-    resolver_bytecode: &Option<AlloyBytes>,
+    resolver_bytecode: Option<&AlloyBytes>,
 ) {
     let tx_req = alloy::rpc::types::TransactionRequest::default()
         .from(resolver_addr)
@@ -323,7 +319,7 @@ async fn trace_call(
         )),
         ..Default::default()
     });
-    opts.state_overrides = build_state_override(resolver_addr, resolver_bytecode);
+    opts.state_overrides = Some(build_state_override(resolver_addr, resolver_bytecode));
     opts.block_overrides = Some(alloy::rpc::types::BlockOverrides {
         time: Some(block_timestamp),
         base_fee: Some(alloy::primitives::U256::from(base_fee_wei)),
@@ -346,8 +342,8 @@ async fn trace_call(
 ///   - Resolver address: grants `EXECUTOR_ROLE` so `settleOrders` doesn't revert.
 fn build_state_override(
     resolver_addr: AlloyAddress,
-    resolver_bytecode: &Option<AlloyBytes>,
-) -> Option<alloy::rpc::types::state::StateOverride> {
+    resolver_bytecode: Option<&AlloyBytes>,
+) -> alloy::rpc::types::state::StateOverride {
     let mut m = alloy::rpc::types::state::StateOverride::default();
 
     // Fee calculator: set our resolver's client fee to 0 bps.
@@ -375,7 +371,7 @@ fn build_state_override(
         });
     }
 
-    Some(m)
+    m
 }
 
 /// Computes the per-client fee config slot on the Fynd fee calculator.
@@ -386,15 +382,15 @@ fn fee_calculator_client_slot(client: AlloyAddress) -> B256 {
     let mut buf = [0u8; 64];
     buf[12..32].copy_from_slice(client.as_slice()); // address left-padded to 32 bytes
     buf[63] = 2; // storage slot 2 as big-endian uint256
-    keccak256(&buf)
+    keccak256(buf)
 }
 
 /// Computes the storage slot for `_roles[EXECUTOR_ROLE].hasRole[account]` in the
-/// OpenZeppelin AccessControl contract (slot 0 = `_roles` mapping, no ERC7201 namespace).
+/// `OpenZeppelin` `AccessControl` contract (slot 0 = `_roles` mapping, no ERC7201 namespace).
 ///
 /// Layout:
-///   roleDataSlot = keccak256(EXECUTOR_ROLE || uint256(0))
-///   hasRoleSlot  = keccak256(account_padded || roleDataSlot)
+///   roleDataSlot = `keccak256`(`EXECUTOR_ROLE` || uint256(0))
+///   hasRoleSlot  = `keccak256`(`account_padded` || `roleDataSlot`)
 fn executor_role_has_role_slot(account: AlloyAddress) -> B256 {
     let executor_role: B256 = keccak256(b"EXECUTOR_ROLE");
 
@@ -402,13 +398,13 @@ fn executor_role_has_role_slot(account: AlloyAddress) -> B256 {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(executor_role.as_slice());
     // last 32 bytes stay zero = uint256(0)
-    let role_data_slot: B256 = keccak256(&buf);
+    let role_data_slot: B256 = keccak256(buf);
 
     // keccak256(account_padded || roleDataSlot) — slot of hasRole[account]
     let mut buf2 = [0u8; 64];
     buf2[12..32].copy_from_slice(account.as_slice()); // address left-padded to 32 bytes
     buf2[32..].copy_from_slice(role_data_slot.as_slice());
-    keccak256(&buf2)
+    keccak256(buf2)
 }
 
 /// Returns the block info for the last confirmed block, or `None` if not yet available.
@@ -420,14 +416,13 @@ fn read_confirmed_block_info(market_data: &MarketData) -> Option<BlockInfo> {
 /// Fetches the baseFee (in wei) from the given confirmed block number.
 ///
 /// Falls back to 0 on any error.  The baseFee is used so our gas-bump estimate matches
-/// what the on-chain Fusion extension computes during eth_call.
+/// what the on-chain Fusion extension computes during `eth_call`.
 async fn fetch_base_fee(provider: &impl Provider, block_number: u64) -> u64 {
     let block_id = alloy::rpc::types::BlockId::number(block_number);
     match provider.get_block(block_id).await {
         Ok(Some(b)) => b
             .header
             .base_fee_per_gas
-            .and_then(|fee| u64::try_from(fee).ok())
             .unwrap_or(0),
         _ => 0,
     }
