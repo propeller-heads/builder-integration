@@ -413,7 +413,12 @@ async fn build_backrun_tx(
     let taking_amount = amount_at_timestamp(fusion_order, *block_ts)?;
 
     // Minimum headroom above the API-derived price estimate (covers duration-mismatch error).
-    const MIN_PROFIT_MARGIN_BPS: u128 = 75; // 0.75%
+    // With the extension-duration fix in client.rs, the duration-mismatch error is eliminated.
+    // The remaining residual (~21 bps at block 25229002) comes from auction-breakpoint
+    // differences between the API's `points` array and the on-chain extension encoding.
+    // 30 bps provides a 9 bps buffer above this residual, filtering genuinely unprofitable
+    // orders while allowing marginal winners through.
+    const MIN_PROFIT_MARGIN_BPS: u128 = 30; // 0.30%
 
     // Check that the Fynd swap output is above the auction price with required margin.
     let biguint_to_u128 = |b: &BigUint| {

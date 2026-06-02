@@ -153,12 +153,27 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
         .with_context(|| format!("auctionStartDate {:?}", item.auction_start_date))?;
     let auction_end_ts = parse_iso_timestamp(&item.auction_end_date)
         .with_context(|| format!("auctionEndDate {:?}", item.auction_end_date))?;
-    let auction_duration_secs = auction_end_ts
+    let api_duration_secs = auction_end_ts
         .checked_sub(auction_start_ts)
         .context("auctionEndDate before auctionStartDate")?;
-    if auction_duration_secs == 0 {
+    if api_duration_secs == 0 {
         bail!("zero-length auction");
     }
+
+    // The API's auctionEndDate is consistently ~96 seconds shorter than the duration
+    // encoded in the 1inch Fusion extension bytes.  Using the API duration causes
+    // amount_at_timestamp to return floor prematurely, making profitable late-auction fills
+    // appear unprofitable.  Override with the on-chain value when it can be decoded.
+    //
+    // Extension layout (offsets from start of raw hex after "0x"):
+    //   [0:64]   32-byte LOP header (section lengths)
+    //   [64:104] 20-byte Dutch-auction extension address
+    //   [104:110] gasBumpEstimate  (uint24)
+    //   [110:116] gasPriceEstimate (uint24)
+    //   [116:124] startTime        (uint32)
+    //   [126:132] duration         (uint24)  ← 180 s for typical orders
+    let auction_duration_secs =
+        decode_extension_duration(&item.extension).unwrap_or(api_duration_secs);
 
     let auction_start_amount = apply_rate_bump(taking_amount, u128::from(item.initial_rate_bump));
 
@@ -207,6 +222,28 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
         receiver_address: item.order.receiver,
         maker_traits: item.order.maker_traits,
     })
+}
+
+/// Decodes the `duration` field from a 1inch Fusion order extension hex string.
+///
+/// Returns `None` if the extension is too short, malformed, or encodes duration = 0.
+/// The duration is stored at bytes 63-65 (uint24, big-endian) of the raw extension:
+///   [0:32]   LOP section-length header (8 × uint32)
+///   [32:52]  Dutch-auction extension address (20 bytes)
+///   [52:55]  gasBumpEstimate  (uint24)
+///   [55:59]  gasPriceEstimate (uint32) ← 4 bytes
+///   [59:63]  startTime        (uint32)
+///   [63:66]  duration         (uint24) ← decoded here; typically 180 s
+fn decode_extension_duration(extension_hex: &str) -> Option<u64> {
+    let raw = extension_hex.strip_prefix("0x").unwrap_or(extension_hex);
+    // Need at least 66 bytes = 132 hex chars
+    if raw.len() < 132 {
+        return None;
+    }
+    // byte offsets: 52+3+4+4 = 63; hex char offset = 63*2 = 126
+    let dur_hex = &raw[126..132]; // bytes 63-65 as 6 hex chars
+    let dur = u64::from_str_radix(dur_hex, 16).ok()?;
+    if dur == 0 { None } else { Some(dur) }
 }
 
 fn parse_iso_timestamp(s: &str) -> anyhow::Result<u64> {
