@@ -9,6 +9,7 @@ mod tests {
     use alloy::primitives::{Address, U256};
     use anyhow::{Context, Result};
     use crate::abi::{build_settle_calldata, RawOrderFields, SettleParams};
+    use crate::{FusionExtOrder, IAmountGetter, IOrderMixin};
 
     fn h(s: &str) -> Result<Vec<u8>> {
         hex::decode(s.replace([' ', '\n'], "")).context("hex decode")
@@ -155,6 +156,135 @@ mod tests {
         anyhow::ensure!(
             hex::encode(router_bytes) == "da892c989d07a18b5dd3f392d949f00df15c5736",
             "Fynd router correctly encoded"
+        );
+
+        Ok(())
+    }
+
+    /// Live RPC test: call `getTakingAmount` on the Fusion extension at block 25222660
+    /// using the exact order that was active at that block.
+    ///
+    /// Requires:  `ETH_RPC_URL` environment variable pointing to an archive node.
+    /// Run with:  `cargo test -p backrunner get_taking_amount_rpc -- --ignored --nocapture`
+    ///
+    /// Success means our ABI encoding is accepted by the extension contract.
+    /// The returned amount should be ≥ the order floor (`1_327_889_927` USDT).
+    #[test]
+    #[ignore = "requires ETH_RPC_URL pointing to an archive node"]
+    fn get_taking_amount_rpc() -> Result<()> {
+        use alloy::sol_types::{SolCall, SolError as _};
+
+        let rpc_url = std::env::var("ETH_RPC_URL").context("ETH_RPC_URL not set")?;
+
+        // Extension address lives at ext_hex[64..104].
+        let ext_hex = EXTENSION_HEX;
+        let ext_addr_bytes = h(&ext_hex[64..104])?;
+        let ext_addr: Address = Address::from_slice(&ext_addr_bytes);
+
+        // Order hash from the 1inch API (the `order_id` field, without 0x).
+        let order_hash_bytes: [u8; 32] =
+            h("ddc5239bef2a6f7afc8967384e209ec5548215abda64e5a68e89e7e0741f2090")?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("order hash not 32 bytes"))?;
+
+        let making_amount: u128 = 671_300_000_000_000_000;
+        let floor_taking_amount: u128 = 1_327_889_927;
+
+        // Extract TakingAmountData section extraData from the extension.
+        // Header bytes [16:20] = TakingAmountData end offset (bits [127:96]).
+        // Header bytes [20:24] = MakingAmountData end offset (bits [95:64]).
+        // Section content starts at 32 + making_end; first 20 bytes = getter address, rest = extraData.
+        let ext_bytes_clone = h(ext_hex)?;
+        let making_end = u32::from_be_bytes(ext_bytes_clone[20..24].try_into()?) as usize;
+        let taking_end = u32::from_be_bytes(ext_bytes_clone[16..20].try_into()?) as usize;
+        let taking_extra_data = alloy::primitives::Bytes::copy_from_slice(
+            &ext_bytes_clone[32 + making_end + 20 .. 32 + taking_end]
+        );
+
+        let call = IAmountGetter::getTakingAmountCall {
+            order: FusionExtOrder {
+                salt:          u256h("ddc5239bef2a6f7afc8967384e209ec5548215abda64e5a68e89e7e0741f2090")?,
+                maker:         u256h("000000000000000000000000c7ae508ddc86d6acfeb80c3f0e972d1a22bacaad")?,
+                receiver:      u256h("000000000000000000000000399740157391a9f1bf4e9921a8834f9bc8f2678e")?,
+                makerAsset:    u256h("000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")?,
+                takerAsset:    u256h("000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7")?,
+                makingAmount:  U256::from(making_amount),
+                takingAmount:  U256::from(floor_taking_amount),
+                makerTraits:   u256h("8a00000000000000000000001254000016006a1d816300000000000000000000")?,
+            },
+            extension:              alloy::primitives::Bytes::from(h(ext_hex)?),
+            orderHash:              alloy::primitives::FixedBytes::from(order_hash_bytes),
+            taker:                  "0x00000000000000000000b09498030ae3416b66Dc".parse()?,
+            makingAmount:           U256::from(making_amount),
+            remainingMakingAmount:  U256::from(making_amount),
+            extraData:              taking_extra_data,
+        };
+
+        // Wrap in LOP.simulate(extension_addr, inner_calldata) — the LOP calls the
+        // extension with msg.sender == LOP, which satisfies any caller check in the extension.
+        // simulate() always reverts with SimulationResults(success, result).
+        let lop_addr: alloy::primitives::Address =
+            "0x111111125421cA6dc452d289314280a0f8842A65".parse()?;
+        let simulate_call = IOrderMixin::simulateCall {
+            target: ext_addr,
+            data: alloy::primitives::Bytes::from(call.abi_encode()),
+        };
+        let lop_hex  = format!("0x{}", hex::encode(lop_addr.as_slice()));
+        let encoded = simulate_call.abi_encode();
+        let data_hex = format!("0x{}", hex::encode(&encoded));
+
+        let block_tag = "0x180de04"; // 25222660 in hex
+
+        // Print for manual curl debugging.
+        // Write calldata to /tmp for manual curl debugging.
+        let _ = std::fs::write("/tmp/simulate_calldata.hex", &data_hex);
+        tracing::info!(
+            target = %format!("0x{}", hex::encode(ext_addr.as_slice())),
+            lop = %lop_hex,
+            block = block_tag,
+            inner_len = encoded.len(),
+            calldata_written_to = "/tmp/simulate_calldata.hex",
+            "simulate() calldata",
+        );
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": lop_hex, "data": data_hex}, block_tag],
+            "id": 1
+        });
+
+        let rt = tokio::runtime::Runtime::new()?;
+        let json: serde_json::Value = rt.block_on(async {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .context("build client")?
+                .post(&rpc_url)
+                .json(&body)
+                .send()
+                .await
+                .context("HTTP send")?
+                .json()
+                .await
+                .context("JSON parse")
+        })?;
+
+        // simulate() always reverts — parse SimulationResults from the error data.
+        let err = json.get("error").context("simulate() did not revert")?;
+        let revert_str = err.get("data").and_then(|d| d.as_str())
+            .context("no revert data in SimulationResults")?;
+        let revert_bytes = h(revert_str.strip_prefix("0x").unwrap_or(revert_str))?;
+        let sim = IOrderMixin::SimulationResults::abi_decode(&revert_bytes)
+            .context("failed to decode SimulationResults")?;
+        anyhow::ensure!(sim.success, "getTakingAmount inner call reverted: {:?}", sim.result);
+
+        anyhow::ensure!(sim.result.len() >= 32, "result too short: {} bytes", sim.result.len());
+        let taking_amount = U256::from_be_slice(&sim.result[..32]);
+        tracing::info!(taking_amount = %taking_amount, floor = floor_taking_amount, "getTakingAmount result");
+        anyhow::ensure!(
+            taking_amount >= U256::from(floor_taking_amount),
+            "taking amount {taking_amount} below floor {floor_taking_amount}",
         );
 
         Ok(())
