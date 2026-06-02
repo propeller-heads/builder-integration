@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+/// Divisor for rate bumps stored in auction points and `init_rate_bump` (1e7 = 100%).
+const RATE_BUMP_DIVISOR: u128 = 10_000_000;
+
+/// Divisor for the integrator/resolver fee encoded in extensions (1e5 = 100%).
+const FEE_DIVISOR: u128 = 100_000;
+
 /// A single breakpoint on the Fusion auction curve.
 ///
 /// `delay_secs` is CUMULATIVE from `auction_start_time` (not relative to the previous point).
@@ -7,8 +13,11 @@ use serde::{Deserialize, Serialize};
 pub struct AuctionPoint {
     /// Seconds elapsed from `auction_start_time` at which this breakpoint applies.
     pub delay_secs: u64,
-    /// Required `to_token` output amount at this breakpoint.
+    /// Required `to_token` output amount at this breakpoint (= `apply_rate_bump(floor, rate_bump)`).
     pub amount: u128,
+    /// Rate bump coefficient from the extension (units of 1e7).  Zero for API-decoded points.
+    #[serde(default)]
+    pub rate_bump: u32,
 }
 
 /// A live 1inch Fusion limit order with its Dutch auction parameters.
@@ -46,6 +55,17 @@ pub struct FusionOrder {
     pub gas_bump_estimate: u32,
     /// Extension gasPriceEstimate (uint32) in units of 10^6 wei (Mwei).
     pub gas_price_estimate_mwei: u32,
+    /// Initial rate bump from the extension (units of 1e7, same as `AuctionPoint.rate_bump`).
+    ///
+    /// Required for the exact on-chain `getTakingAmount` formula. Zero when decoded from API only.
+    #[serde(default)]
+    pub init_rate_bump: u32,
+    /// Combined integrator + resolver fee from the extension (units of 1e5).
+    ///
+    /// Applied as `ceil(floor × (1e5 + fee) / 1e5)` before the rate-bump multiplier.
+    /// Zero when no fee is present or when decoded from API only.
+    #[serde(default)]
+    pub total_fees_1e5: u32,
     /// EIP-712 maker signature (65 bytes, `0x`-prefixed hex).
     pub signature: String,
     /// Fusion Dutch-auction extension bytes (`0x`-prefixed hex, may be `"0x"` if empty).
@@ -70,10 +90,87 @@ pub fn is_gtc_order(order: &FusionOrder) -> bool {
         && order.auction_duration_secs > GTC_DURATION_THRESHOLD_SECS
 }
 
+/// Computes the exact on-chain taking amount matching `SimpleSettlement.getTakingAmount`:
+///
+/// ```text
+/// auctionBump = interpolate rate bumps at unix_ts (piecewise-linear on coefficients)
+/// gasBump     = gasBumpEstimate × baseFee / (gasPriceEstimate × 10^6)
+/// rateBump    = max(0, auctionBump − gasBump)          ← gas subtracts from rate
+/// withFees    = ceil(floor × (1e5 + totalFees) / 1e5)
+/// final       = ceil(withFees × (1e7 + rateBump) / 1e7)
+/// ```
+///
+/// Returns `None` when the auction has not started or has expired.
+///
+/// Falls back to `amount_at_timestamp` semantics if `init_rate_bump == 0` (API-only decode),
+/// in which case `total_fees_1e5` is still applied if non-zero.
+pub fn onchain_taking_amount(order: &FusionOrder, unix_ts: u64, base_fee_wei: u64) -> Option<u128> {
+    let elapsed = elapsed_secs(order, unix_ts)?;
+    let auction_bump = interpolate_rate_bump(order, elapsed);
+    let gas_bump = compute_gas_bump(order, base_fee_wei);
+    let rate_bump = auction_bump.saturating_sub(gas_bump);
+    let with_fees = apply_fee_bump(order.auction_end_amount, u128::from(order.total_fees_1e5));
+    Some(apply_rate_bump_order(with_fees, rate_bump))
+}
+
+/// Interpolates the auction rate bump at `elapsed` seconds using `order.points[].rate_bump`.
+///
+/// Matches the on-chain `_getAuctionBump` piecewise-linear interpolation on rate-bump
+/// coefficients (units of 1e7).  Returns 0 when the auction has expired.
+fn interpolate_rate_bump(order: &FusionOrder, elapsed: u64) -> u128 {
+    let mut current_t: u64 = 0;
+    let mut current_bump = u128::from(order.init_rate_bump);
+
+    for point in &order.points {
+        if elapsed <= point.delay_secs {
+            return interp_bump(current_t, current_bump, point.delay_secs, u128::from(point.rate_bump), elapsed);
+        }
+        current_t = point.delay_secs;
+        current_bump = u128::from(point.rate_bump);
+    }
+
+    // Past all explicit points: decay linearly from last point to 0 at duration end.
+    let duration = order.auction_duration_secs;
+    if duration > current_t {
+        interp_bump(current_t, current_bump, duration, 0, elapsed)
+    } else {
+        0
+    }
+}
+
+/// Linear interpolation between two (time, bump) pairs — floor division, matching Solidity.
+fn interp_bump(t0: u64, b0: u128, t1: u64, b1: u128, t: u64) -> u128 {
+    if t1 == t0 {
+        return b0;
+    }
+    let span = u128::from(t1 - t0);
+    let elapsed_in = u128::from(t - t0);
+    let remaining = u128::from(t1 - t);
+    (b0.saturating_mul(remaining).saturating_add(b1.saturating_mul(elapsed_in))) / span
+}
+
+/// `base + ceil(base × fees / FEE_DIVISOR)` — fee applied with 1e5 denominator.
+fn apply_fee_bump(base: u128, fees: u128) -> u128 {
+    let increment = base
+        .saturating_mul(fees)
+        .saturating_add(FEE_DIVISOR - 1)
+        / FEE_DIVISOR;
+    base.saturating_add(increment)
+}
+
+/// `base + ceil(base × bump / RATE_BUMP_DIVISOR)` — rate bump with 1e7 denominator.
+fn apply_rate_bump_order(base: u128, bump: u128) -> u128 {
+    let increment = base
+        .saturating_mul(bump)
+        .saturating_add(RATE_BUMP_DIVISOR - 1)
+        / RATE_BUMP_DIVISOR;
+    base.saturating_add(increment)
+}
+
 /// Computes the gas-bump rate for an order given the pending block's base fee.
 ///
 /// On-chain formula: `gasBump = gasBumpEstimate × baseFee_wei / (gasPriceEstimate × 10^6)`
-/// This additional bump is added to the auction bump when computing `taking_amount`.
+/// The gas bump is SUBTRACTED from the auction bump in `onchain_taking_amount`.
 ///
 /// Returns 0 when the order has no gas-bump configured (`gas_price_estimate_mwei == 0`).
 pub fn compute_gas_bump(order: &FusionOrder, base_fee_wei: u64) -> u128 {
@@ -156,6 +253,8 @@ mod tests {
             to_token_usd_rate: 1.0,
             gas_bump_estimate: 0,
             gas_price_estimate_mwei: 0,
+            init_rate_bump: 0,
+            total_fees_1e5: 0,
             signature: "0x00".to_string(),
             extension: "0x".to_string(),
             salt: "0".to_string(),
@@ -189,7 +288,7 @@ mod tests {
     #[test]
     fn two_segment_breakpoint() {
         let order = FusionOrder {
-            points: vec![AuctionPoint { delay_secs: 100, amount: 900 }],
+            points: vec![AuctionPoint { delay_secs: 100, amount: 900, rate_bump: 0 }],
             ..simple_order()
         };
         assert_eq!(amount_at_timestamp(&order, 1_050), Some(950));
@@ -263,6 +362,8 @@ mod tests {
             to_token_usd_rate:   0.0,
             gas_bump_estimate:       343_213,
             gas_price_estimate_mwei:   2_076,
+            init_rate_bump: 0,
+            total_fees_1e5: 0,
             signature: "0x".into(),
             extension: "0x".into(),
             salt: "0".into(),
@@ -342,6 +443,8 @@ mod tests {
             to_token_usd_rate:   0.0,
             gas_bump_estimate:       3_080,
             gas_price_estimate_mwei:   336,
+            init_rate_bump: 0,
+            total_fees_1e5: 0,
             signature: "0x".into(),
             extension: "0x".into(),
             salt: "0".into(),
@@ -422,6 +525,8 @@ mod tests {
             to_token_usd_rate:   0.0,
             gas_bump_estimate:        126_727,
             gas_price_estimate_mwei:    1_433,
+            init_rate_bump: 0,
+            total_fees_1e5: 0,
             signature:        "0x".into(),
             extension:        "0x".into(),
             salt:             "0".into(),
@@ -434,10 +539,61 @@ mod tests {
     fn uni_order_with_pts() -> FusionOrder {
         FusionOrder {
             points: vec![
-                AuctionPoint { delay_secs: 24,  amount: 61_744_116 },
-                AuctionPoint { delay_secs: 360, amount: 60_990_838 },
+                AuctionPoint { delay_secs: 24,  amount: 61_744_116, rate_bump: 0 },
+                AuctionPoint { delay_secs: 360, amount: 60_990_838, rate_bump: 0 },
             ],
             ..uni_order_no_pts()
+        }
+    }
+
+    // ── Smoke run 4 — USDC→floor order 0x1dca545a (VERIFIED against on-chain) ──────────
+    //
+    // Order: 0x1dca545afebf78140bb8fc7807401cc57f4cec36f7cf6d3f7e8f1e7e535ff3c6
+    //   floor = 584_777_961
+    //   startTime = 1_780_417_052, duration = 180s
+    //   gasBumpEstimate = 126, gasPriceEstimate = 2501 Mwei
+    //   initRateBump = 62_126 (gives start_amount = 588_410_953 = apply_rate_bump(floor, 62126))
+    //   totalFees = 300 (resolverFee=300 in 1e5 units = 0.3%)
+    //
+    // Extension points (RELATIVE timeDelta):
+    //   coeff=50377, timeDelta=60  → cumulative t=60
+    //   coeff=50236, timeDelta=84  → cumulative t=60+84=144
+    //   coeff=126,   timeDelta=36  → cumulative t=144+36=180 (=duration)
+    //
+    // Ground truth at block_ts=1_780_417_175, base_fee=2_310_734_453:
+    //   elapsed=123, gasBump=116, auctionBump=50_271, rateBump=50_155
+    //   withFees=586_532_295, onchain_taking=589_474_048
+    fn dca_order() -> FusionOrder {
+        FusionOrder {
+            order_id: "0x1dca545afebf78140bb8fc7807401cc57f4cec36f7cf6d3f7e8f1e7e535ff3c6".into(),
+            from_token: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),
+            to_token:   "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+            making_amount: 100_000_000_000_000_000,
+            auction_start_amount: 588_410_953,
+            auction_end_amount:   584_777_961,
+            auction_duration_secs: 180,
+            auction_start_time:    1_780_417_052,
+            points: vec![
+                AuctionPoint { delay_secs:  60, amount: 587_723_897, rate_bump: 50_377 },
+                AuctionPoint { delay_secs: 144, amount: 587_715_642, rate_bump: 50_236 },
+                AuctionPoint { delay_secs: 180, amount: 584_785_334, rate_bump:    126 },
+            ],
+            from_token_symbol: Some("WETH".into()),
+            to_token_symbol:   Some("USDC".into()),
+            from_token_decimals: 18,
+            to_token_decimals:    6,
+            from_token_usd_rate: 0.0,
+            to_token_usd_rate:   0.0,
+            gas_bump_estimate:       126,
+            gas_price_estimate_mwei: 2_501,
+            init_rate_bump:  62_126,
+            total_fees_1e5:    300,
+            signature:        "0x".into(),
+            extension:        "0x".into(),
+            salt:             "0".into(),
+            maker_address:    "0x0000000000000000000000000000000000000000".into(),
+            receiver_address: "0x0000000000000000000000000000000000000000".into(),
+            maker_traits:     "0".into(),
         }
     }
 
@@ -499,5 +655,35 @@ mod tests {
             amount_at_timestamp(&uni_order_no_pts(), 1_780_417_845 + 360),
             None,
         );
+    }
+
+    // ── onchain_taking_amount tests — exact match against query_onchain_taking_amount ──
+
+    #[test]
+    fn dca_gas_bump() {
+        // 126 * 2_310_734_453 / (2501 * 1_000_000) = 116
+        assert_eq!(compute_gas_bump(&dca_order(), 2_310_734_453), 116);
+    }
+
+    #[test]
+    fn dca_onchain_taking_matches_ground_truth() {
+        // Verified: query_onchain_taking_amount returned 589_474_048 at this block.
+        // Formula: auctionBump=50_271, gasBump=116, rateBump=50_155
+        //   withFees = ceil(584_777_961 * 100_300 / 100_000) = 586_532_295
+        //   final    = ceil(586_532_295 * 10_050_155 / 10_000_000) = 589_474_048
+        assert_eq!(
+            onchain_taking_amount(&dca_order(), 1_780_417_175, 2_310_734_453),
+            Some(589_474_048),
+        );
+    }
+
+    #[test]
+    fn dca_before_start_returns_none() {
+        assert_eq!(onchain_taking_amount(&dca_order(), 1_780_417_051, 2_310_734_453), None);
+    }
+
+    #[test]
+    fn dca_expired_returns_none() {
+        assert_eq!(onchain_taking_amount(&dca_order(), 1_780_417_052 + 180, 2_310_734_453), None);
     }
 }

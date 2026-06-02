@@ -39,7 +39,7 @@ use fynd_core::{
     SolverBuildError,
 };
 use num_bigint::BigUint;
-use order::{amount_at_timestamp, compute_gas_bump, is_gtc_order, FusionOrder};
+use order::{amount_at_timestamp, compute_gas_bump, is_gtc_order, onchain_taking_amount, FusionOrder};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, warn};
 use tycho_simulation::tycho_client::feed::BlockHeader;
@@ -518,16 +518,11 @@ async fn build_backrun_tx(
 ) -> Option<BackrunTx> {
     let BackrunContext { uuid, block_ts, base_fee, backrunner, .. } = ctx;
 
-    let taking_amount_auction_only = amount_at_timestamp(fusion_order, *block_ts)?;
-
-    // gas_bump: floor × gasBumpEstimate × baseFee / (gasPriceEstimate × 10^6), ceiling-rounded.
-    let gas_bump = compute_gas_bump(fusion_order, *base_fee);
-    let gas_bump_taking = fusion_order.auction_end_amount
-        .saturating_mul(gas_bump)
-        .saturating_add(9_999_999)
-        / 10_000_000;
-
-    let taking_amount_full = taking_amount_auction_only.saturating_add(gas_bump_taking);
+    // Exact on-chain taking amount estimate:
+    //   rateBump = max(0, auctionBump − gasBump)      ← gas subtracts from rate
+    //   withFees = ceil(floor × (1e5 + totalFees) / 1e5)
+    //   taking   = ceil(withFees × (1e7 + rateBump) / 1e7)
+    let taking_amount_full = onchain_taking_amount(fusion_order, *block_ts, *base_fee)?;
     let taking_amount = if fill_amount < fusion_order.making_amount && fusion_order.making_amount > 0
     {
         taking_amount_full.saturating_mul(fill_amount) / fusion_order.making_amount
@@ -536,9 +531,11 @@ async fn build_backrun_tx(
     };
 
     let elapsed_secs = block_ts.saturating_sub(fusion_order.auction_start_time);
+    let gas_bump = compute_gas_bump(fusion_order, *base_fee);
     debug!(%uuid, order_id = %fusion_order.order_id,
         floor = fusion_order.auction_end_amount, start_amount = fusion_order.auction_start_amount,
-        elapsed_secs, base_fee, gas_bump, gas_bump_taking,
+        elapsed_secs, base_fee, gas_bump,
+        total_fees_1e5 = fusion_order.total_fees_1e5,
         points_count = fusion_order.points.len(), taking_estimate = taking_amount,
         "auction price estimate");
 

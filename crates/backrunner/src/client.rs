@@ -179,24 +179,33 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
         .map_or_else(|| u128::from(item.initial_rate_bump), |p| u128::from(p.init_rate_bump));
     let gas_bump_estimate       = ext_params.as_ref().map_or(0, |p| p.gas_bump_estimate);
     let gas_price_estimate_mwei = ext_params.as_ref().map_or(0, |p| p.gas_price_estimate_mwei);
+    let init_rate_bump          = ext_params.as_ref().map_or(0, |p| p.init_rate_bump);
+    let total_fees_1e5          = ext_params.as_ref().map_or(0, |p| p.total_fees);
 
     let auction_start_amount = apply_rate_bump(taking_amount, eff_initial_rate_bump);
 
     // Prefer extension-decoded points: the 1inch API frequently returns empty points
     // for orders that DO have extension breakpoints, causing systematic underestimation.
-    // Extension delays are already cumulative from auction start; API delays are relative.
+    //
+    // Extension timeDelta values are RELATIVE (each delta added to the previous point's
+    // cumulative time).  API points are also relative.
     let points: Vec<AuctionPoint> = if let Some(ext) = ext_params.as_ref().filter(|e| !e.points.is_empty()) {
-        ext
-            .points
-            .iter()
-            .filter(|&&(_, d)| u64::from(d) <= auction_duration_secs)
-            .map(|&(coeff, delay)| AuctionPoint {
-                delay_secs: u64::from(delay),
+        let mut cum: u64 = 0;
+        let mut pts = Vec::with_capacity(ext.points.len());
+        for &(coeff, delta) in &ext.points {
+            cum += u64::from(delta);
+            if cum > auction_duration_secs {
+                break;
+            }
+            pts.push(AuctionPoint {
+                delay_secs: cum,
                 amount: apply_rate_bump(taking_amount, u128::from(coeff)),
-            })
-            .collect()
+                rate_bump: coeff,
+            });
+        }
+        pts
     } else {
-        // Fall back to API points (relative delays, need accumulation).
+        // Fall back to API points (relative delays, need accumulation, no rate_bump).
         let mut cum: u64 = 0;
         let mut pts = Vec::with_capacity(item.points.len());
         for p in &item.points {
@@ -207,6 +216,7 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
             pts.push(AuctionPoint {
                 delay_secs: cum,
                 amount: apply_rate_bump(taking_amount, p.coefficient),
+                rate_bump: 0,
             });
         }
         pts
@@ -241,6 +251,8 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
         to_token_usd_rate: item.to_token_to_usdc_rate.unwrap_or(0.0),
         gas_bump_estimate,
         gas_price_estimate_mwei,
+        init_rate_bump,
+        total_fees_1e5,
         signature: item.signature,
         extension: item.extension,
         salt: item.order.salt,
@@ -257,11 +269,13 @@ struct ExtensionParams {
     init_rate_bump: u32,
     gas_bump_estimate: u32,
     gas_price_estimate_mwei: u32,
-    /// Auction breakpoints: `(coefficient, cumulative_delay_secs)`.
+    /// Auction breakpoints: `(coefficient, timeDelta_seconds)`.
     ///
-    /// Delays are cumulative from `start_time` (not relative between consecutive points).
-    /// Amounts are derived via `apply_rate_bump(floor, coefficient)` in `convert()`.
+    /// **`timeDelta` is RELATIVE** to the previous point (or auction start for the first point).
+    /// Cumulative delays are computed in `convert()` when populating `AuctionPoint.delay_secs`.
     points: Vec<(u32, u16)>,
+    /// `integratorFee + resolverFee` encoded in the extension (units of 1e5 = 100%).
+    total_fees: u32,
 }
 
 /// Decodes auction parameters from a 1inch Fusion extension hex string.
@@ -292,8 +306,8 @@ fn decode_extension_params(extension_hex: &str) -> Option<ExtensionParams> {
     }
 
     // Parse auction breakpoints when present.
-    // Each point: 6 hex chars (coeff uint24) + 4 hex chars (delay uint16) = 10 chars.
-    let points = if raw.len() >= 140 {
+    // Each point: 6 hex chars (coeff uint24) + 4 hex chars (timeDelta_relative uint16).
+    let (points, total_fees) = if raw.len() >= 140 {
         let count = usize::from(u8::from_str_radix(&raw[138..140], 16).unwrap_or(0));
         let mut pts = Vec::with_capacity(count);
         for i in 0..count {
@@ -304,14 +318,28 @@ fn decode_extension_params(extension_hex: &str) -> Option<ExtensionParams> {
             let Ok(coeff) = u32::from_str_radix(&raw[base..base + 6], 16) else {
                 break;
             };
-            let Ok(delay) = u16::from_str_radix(&raw[base + 6..base + 10], 16) else {
+            let Ok(delta) = u16::from_str_radix(&raw[base + 6..base + 10], 16) else {
                 break;
             };
-            pts.push((coeff, delay));
+            pts.push((coeff, delta));
         }
-        pts
+
+        // Fee data starts immediately after points: [138 + 2 + count*10 .. ]
+        // Layout: integratorFee (uint16, 4 chars) | integratorShare (uint8, 2 chars)
+        //         resolverFee (uint16, 4 chars)   | whitelistDiscount (uint8, 2 chars)
+        let fee_base = 140 + count * 10;
+        let fees = if raw.len() >= fee_base + 12 {
+            let integrator_fee =
+                u32::from_str_radix(&raw[fee_base..fee_base + 4], 16).unwrap_or(0);
+            let resolver_fee =
+                u32::from_str_radix(&raw[fee_base + 6..fee_base + 10], 16).unwrap_or(0);
+            integrator_fee + resolver_fee
+        } else {
+            0
+        };
+        (pts, fees)
     } else {
-        Vec::new()
+        (Vec::new(), 0)
     };
 
     Some(ExtensionParams {
@@ -321,6 +349,7 @@ fn decode_extension_params(extension_hex: &str) -> Option<ExtensionParams> {
         gas_bump_estimate,
         gas_price_estimate_mwei,
         points,
+        total_fees,
     })
 }
 
@@ -329,8 +358,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_extension_params_parses_two_points() {
-        // Synthetic extension: 32-byte LOP header + 20-byte address + fixed fields + 2 points.
+    fn decode_extension_params_parses_two_points_and_fee() {
+        // Synthetic: 32-byte header + 20-byte address + fixed fields + 2 points + fee bytes.
+        // timeDelta values are RELATIVE (not cumulative).
         let ext = concat!(
             "0x",
             "0000000000000000000000000000000000000000000000000000000000000000", // LOP header
@@ -341,8 +371,12 @@ mod tests {
             "000064",   // duration         = 100 s
             "000001",   // initialRateBump  = 1
             "02",           // 2 points
-            "000100000A",   // coeff=256, delay=10 (cumulative)
-            "0000800064",   // coeff=128, delay=100 (cumulative)
+            "000100000A",   // coeff=256, timeDelta=10 (relative)
+            "0000800064",   // coeff=128, timeDelta=100 (relative)
+            "012c",         // integratorFee = 300 (in 1e5)
+            "64",           // integratorShare = 100
+            "0000",         // resolverFee = 0
+            "64",           // whitelistDiscountNumerator = 100
         );
         let p = decode_extension_params(ext).expect("should decode");
         assert_eq!(p.start_time, 100);
@@ -351,6 +385,7 @@ mod tests {
         assert_eq!(p.gas_bump_estimate, 1);
         assert_eq!(p.gas_price_estimate_mwei, 1);
         assert_eq!(p.points, vec![(256, 10), (128, 100)]);
+        assert_eq!(p.total_fees, 300); // integratorFee=300 + resolverFee=0
     }
 
     #[test]
@@ -364,6 +399,7 @@ mod tests {
         );
         let p = decode_extension_params(ext).expect("should decode");
         assert!(p.points.is_empty());
+        assert_eq!(p.total_fees, 0);
     }
 
     #[test]
