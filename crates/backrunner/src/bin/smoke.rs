@@ -247,7 +247,7 @@ async fn run_block_loop(
             Some(c) => {
                 tracing::info!(block_number, txs = c.txs.len(),
                     "candidate found — validating via eth_call with bytecode override");
-                validate_candidate_txs(&c.txs, block_number, block_timestamp, &provider, resolver_addr, &resolver_bytecode).await;
+                validate_candidate_txs(&c.txs, block_number, block_timestamp, base_fee_per_gas, &provider, resolver_addr, &resolver_bytecode).await;
             }
         }
     }
@@ -259,17 +259,17 @@ async fn validate_candidate_txs(
     txs: &[builder_types::BackrunTx],
     block_number: u64,
     block_timestamp: u64,
+    base_fee_wei: u64,
     provider: &impl Provider,
     resolver_addr: AlloyAddress,
     resolver_bytecode: &Option<AlloyBytes>,
 ) {
-    // Override the block timestamp so the Dutch auction sees the pending block's time.
-    // Note: the base_fee BlockOverride is intentionally NOT set here — Alchemy ignores
-    // it for eth_call, so the on-chain gasBump is computed from the actual confirmed
-    // block's baseFee.  Our profitability estimate in build_backrun_tx already accounts
-    // for this via compute_gas_bump(), so both sides are consistent.
+    // Override both the block timestamp (for auction timing) and baseFee (for gasBump
+    // computation). Using the same baseFee that was used in the profitability estimate
+    // ensures the on-chain taking amount matches our prediction.
     let block_overrides = alloy::rpc::types::BlockOverrides {
         time: Some(block_timestamp),
+        base_fee: Some(alloy::primitives::U256::from(base_fee_wei)),
         ..Default::default()
     };
 
@@ -295,18 +295,19 @@ async fn validate_candidate_txs(
             Err(e) => {
                 tracing::warn!(block_number, tx_index = i, error = %e, "eth_call REVERTED");
                 if i == 0 {
-                    trace_call(backrun_tx, block_number, block_timestamp, provider, resolver_addr, resolver_bytecode).await;
+                    trace_call(backrun_tx, block_number, block_timestamp, base_fee_wei, provider, resolver_addr, resolver_bytecode).await;
                 }
             }
         }
     }
 }
 
-/// Issues `debug_traceCall` with the same block timestamp override used in `eth_call`.
+/// Issues `debug_traceCall` with the same block overrides used in `eth_call`.
 async fn trace_call(
     backrun_tx: &builder_types::BackrunTx,
     block_number: u64,
     block_timestamp: u64,
+    base_fee_wei: u64,
     provider: &impl Provider,
     resolver_addr: AlloyAddress,
     resolver_bytecode: &Option<AlloyBytes>,
@@ -325,6 +326,7 @@ async fn trace_call(
     opts.state_overrides = build_state_override(resolver_addr, resolver_bytecode);
     opts.block_overrides = Some(alloy::rpc::types::BlockOverrides {
         time: Some(block_timestamp),
+        base_fee: Some(alloy::primitives::U256::from(base_fee_wei)),
         ..Default::default()
     });
     match provider.debug_trace_call(tx_req, alloy::rpc::types::BlockId::latest(), opts).await {
