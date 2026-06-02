@@ -100,8 +100,15 @@ pub struct SettleParams<'a> {
     pub signature: &'a [u8],
     /// Fusion extension bytes from the API (raw bytes).
     pub extension: &'a [u8],
-    /// Auction price at this block timestamp (price threshold, bits 0-79).
+    /// Max taking amount we are willing to pay (takerTraits threshold, bits 0-184).
+    /// Usually `amount_out_gross` from Fynd. The LOP reverts `TakingAmountTooHigh` if the
+    /// Dutch auction price exceeds this.
     pub taking_amount: u128,
+    /// The `amount` parameter passed to `fillOrderArgs` / `fillContractOrderArgs`.
+    /// For a full fill this equals `order_fields.making_amount`. For a partial fill (when the
+    /// order's remaining on-chain making amount is less than the full amount) set this to the
+    /// remaining making amount so the LOP doesn't scale the threshold.
+    pub fill_amount: alloy::primitives::U256,
     /// Fynd/Tycho router address (used for both primary swap and surplus→WETH swap).
     pub router: Address,
     /// Fynd swap calldata with `receiver = resolver_address`.
@@ -184,7 +191,7 @@ pub fn build_settle_calldata(p: &SettleParams<'_>) -> Bytes {
             order,
             r: r.into(),
             vs: vs_bytes.into(),
-            amount: p.order_fields.making_amount,
+            amount: p.fill_amount,
             takerTraits: taker_traits,
             args: Bytes::from(args),
         }
@@ -194,7 +201,7 @@ pub fn build_settle_calldata(p: &SettleParams<'_>) -> Bytes {
         IOrderMixin::fillContractOrderArgsCall {
             order,
             signature: Bytes::copy_from_slice(p.signature),
-            amount: p.order_fields.making_amount,
+            amount: p.fill_amount,
             takerTraits: taker_traits,
             args: Bytes::from(args),
         }
@@ -234,6 +241,7 @@ mod tests {
             signature: &[0u8; 65],
             extension: &[],
             taking_amount: 999_u128,
+            fill_amount: order_fields.making_amount,
             router: Address::ZERO,
             primary_swap_calldata: &[0xde, 0xad],
             surplus_calldata: &[],
@@ -257,6 +265,7 @@ mod tests {
             signature: &[0u8; 65],
             extension: &extension,
             taking_amount: 0,
+            fill_amount: order_fields.making_amount,
             router: Address::ZERO,
             primary_swap_calldata: &[],
             surplus_calldata: &[],

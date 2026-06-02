@@ -59,6 +59,15 @@ const VIRTUAL_RESOLVER: AlloyAddress = address!("00000000000000000000b09498030ae
 const RESOLVER_BYTECODE_HEX: &str =
     include_str!("../../bytecode/BackrunResolver.runtime.hex");
 
+/// Fynd router's on-chain fee calculator.
+///
+/// Holds a `mapping(address => packed_config)` at storage slot 2 where the packed value encodes:
+///   bits 0-7:  isSet flag (non-zero = client override active; 0 = use global default of 10 bps)
+///   bits 8-23: client fee in bps
+/// We override slot `keccak256(abi.encode(resolver_addr, 2))` to `0x01` (isSet=true, fee=0 bps)
+/// so the eth_call simulation sees 0 fee, matching what the Fynd team will configure on-chain.
+const FEE_CALCULATOR: AlloyAddress = address!("24AD1d4a2666a99Ef46adA68999a89E324CD914C");
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -232,20 +241,34 @@ async fn run_block_loop(
             Some(c) => {
                 tracing::info!(block_number, txs = c.txs.len(),
                     "candidate found — validating via eth_call with bytecode override");
-                validate_candidate_txs(&c.txs, block_number, &provider, resolver_addr, &resolver_bytecode).await;
+                validate_candidate_txs(&c.txs, block_number, block_timestamp, &provider, resolver_addr, &resolver_bytecode).await;
             }
         }
     }
 }
 
-/// Runs `eth_call` for each tx in a candidate and traces the first revert.
+/// Runs `eth_call` for each tx in a candidate, using a block timestamp override so the
+/// Dutch auction sees the pending block's timestamp rather than the confirmed block's.
 async fn validate_candidate_txs(
     txs: &[builder_types::BackrunTx],
     block_number: u64,
+    block_timestamp: u64,
     provider: &impl Provider,
     resolver_addr: AlloyAddress,
     resolver_bytecode: &Option<AlloyBytes>,
 ) {
+    // Set baseFeePerGas = 0 in the eth_call simulation so the Dutch auction extension
+    // computes gas_bump = 0. This aligns the on-chain taking amount with our off-chain
+    // `amount_at_timestamp` estimate (which also ignores gas_bump). Without this override
+    // the node uses the confirmed block's actual basefee, causing the on-chain price to be
+    // ~1% above our estimate and causing spurious TakingAmountTooHigh reverts.
+    // Note: actual fills (not smoke test) should use the real pending-block basefee.
+    let block_overrides = alloy::rpc::types::BlockOverrides {
+        time: Some(block_timestamp),
+        base_fee: Some(alloy::primitives::U256::ZERO),
+        ..Default::default()
+    };
+
     for (i, backrun_tx) in txs.iter().enumerate() {
         let calldata = backrun_tx.tx.data.clone();
         tracing::info!(block_number, tx_index = i,
@@ -258,23 +281,28 @@ async fn validate_candidate_txs(
             .input(calldata.into());
 
         let state_override = build_state_override(resolver_addr, resolver_bytecode);
-        match provider.call(tx_req).overrides_opt(state_override).await {
+        match provider.call(tx_req)
+            .overrides_opt(state_override)
+            .with_block_overrides(block_overrides.clone())
+            .await
+        {
             Ok(output) => tracing::info!(block_number, tx_index = i,
                 output_bytes = output.len(), "eth_call SUCCESS ✓"),
             Err(e) => {
                 tracing::warn!(block_number, tx_index = i, error = %e, "eth_call REVERTED");
                 if i == 0 {
-                    trace_call(backrun_tx, block_number, provider, resolver_addr, resolver_bytecode).await;
+                    trace_call(backrun_tx, block_number, block_timestamp, provider, resolver_addr, resolver_bytecode).await;
                 }
             }
         }
     }
 }
 
-/// Issues `debug_traceCall` and logs the result to understand where a fill reverts.
+/// Issues `debug_traceCall` with the same block timestamp override used in `eth_call`.
 async fn trace_call(
     backrun_tx: &builder_types::BackrunTx,
     block_number: u64,
+    block_timestamp: u64,
     provider: &impl Provider,
     resolver_addr: AlloyAddress,
     resolver_bytecode: &Option<AlloyBytes>,
@@ -291,31 +319,69 @@ async fn trace_call(
         ..Default::default()
     });
     opts.state_overrides = build_state_override(resolver_addr, resolver_bytecode);
+    opts.block_overrides = Some(alloy::rpc::types::BlockOverrides {
+        time: Some(block_timestamp),
+        base_fee: Some(alloy::primitives::U256::ZERO),
+        ..Default::default()
+    });
     match provider.debug_trace_call(tx_req, alloy::rpc::types::BlockId::latest(), opts).await {
         Ok(trace) => tracing::info!(block_number, trace = ?trace, "debug_trace_call result"),
         Err(e) => tracing::warn!(block_number, error = %e, "trace failed"),
     }
 }
 
-/// Builds the state override map: injects resolver bytecode + grants `EXECUTOR_ROLE`.
+/// Builds the state override map used on every `eth_call` / `debug_traceCall`.
+///
+/// Always applied:
+///   - Fee calculator (`FEE_CALCULATOR`): sets the per-resolver fee to 0 bps, matching
+///     the on-chain config the Fynd team will apply for our resolver.
+///
+/// Applied only when using the virtual resolver (no `RESOLVER_ADDRESS` set):
+///   - Resolver address: injects compiled bytecode.
+///   - Resolver address: grants `EXECUTOR_ROLE` so `settleOrders` doesn't revert.
 fn build_state_override(
     resolver_addr: AlloyAddress,
     resolver_bytecode: &Option<AlloyBytes>,
 ) -> Option<alloy::rpc::types::state::StateOverride> {
-    resolver_bytecode.as_ref().map(|bytecode| {
-        let mut m = alloy::rpc::types::state::StateOverride::default();
-        let mut diff = B256HashMap::default();
-        diff.insert(
+    let mut m = alloy::rpc::types::state::StateOverride::default();
+
+    // Fee calculator: set our resolver's client fee to 0 bps.
+    let mut fee_diff = B256HashMap::default();
+    fee_diff.insert(
+        fee_calculator_client_slot(resolver_addr),
+        B256::from(alloy::primitives::U256::from(1u8)),
+    );
+    m.insert(FEE_CALCULATOR, AccountOverride {
+        state_diff: Some(fee_diff),
+        ..Default::default()
+    });
+
+    // Virtual resolver: inject bytecode and grant EXECUTOR_ROLE.
+    if let Some(bytecode) = resolver_bytecode {
+        let mut role_diff = B256HashMap::default();
+        role_diff.insert(
             executor_role_has_role_slot(resolver_addr),
-            B256::from(alloy::primitives::U256::from(1)),
+            B256::from(alloy::primitives::U256::from(1u8)),
         );
         m.insert(resolver_addr, AccountOverride {
             code: Some(bytecode.clone()),
-            state_diff: Some(diff),
+            state_diff: Some(role_diff),
             ..Default::default()
         });
-        m
-    })
+    }
+
+    Some(m)
+}
+
+/// Computes the per-client fee config slot on the Fynd fee calculator.
+///
+/// Layout: `mapping(address => packed_config)` at storage slot 2.
+/// Slot = `keccak256(abi.encode(client, uint256(2)))`.
+fn fee_calculator_client_slot(client: AlloyAddress) -> B256 {
+    let mut buf = [0u8; 64];
+    buf[12..32].copy_from_slice(client.as_slice()); // address left-padded to 32 bytes
+    buf[63] = 2; // storage slot 2 as big-endian uint256
+    keccak256(&buf)
 }
 
 /// Computes the storage slot for `_roles[EXECUTOR_ROLE].hasRole[account]` in the

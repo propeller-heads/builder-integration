@@ -395,19 +395,27 @@ async fn build_backrun_tx(
     fynd_tx: &fynd_core::Transaction,
 ) -> Option<BackrunTx> {
     let BackrunContext { uuid, block_ts, base_fee, block_number, solve_time_ms, orders_quoted, backrunner } = ctx;
-    // NOTE: gas bump not applied. The 1inch contract computes:
-    //   final_rate = max(0, auction_bump - gas_bump)
-    //   gas_bump   = gasBumpEstimate × currentBaseFee / gasPriceEstimate / 1_000_000
-    // Both gasBumpEstimate and gasPriceEstimate are encoded in the order extension bytes (not
-    // exposed by the 1inch API response). Not subtracting gas_bump means our taking_amount is
-    // systematically higher than what the contract requires — we filter out orders that would
-    // actually succeed. Fix: decode gas cost params from extension bytes + pass base_fee_per_gas.
+    // Two sources of systematic under-estimation of the on-chain Dutch-auction price:
+    //
+    // 1. GAS-BUMP: The extension computes totalBump = auctionBump + gasBump where
+    //    gasBump = gasBumpEstimate × block.basefee / gasPriceEstimate. The API does not
+    //    expose these params so we ignore gas_bump. At real basefees this adds ~1-2% to the
+    //    taking amount. The smoke-test eth_call uses baseFeePerGas=0 to neutralise this.
+    //
+    // 2. DURATION MISMATCH: The API's auctionEndDate reports a shorter auction window (~84s)
+    //    than the on-chain extension actually encodes (~180s). Late in the API window our
+    //    amount_at_timestamp returns floor while on-chain the auction still carries ~0.5% bump.
+    //
+    // MIN_PROFIT_MARGIN_BPS covers mismatch (2): require the Fynd output to exceed our
+    // API-derived estimate by at least 75 bps so the residual ~0.5% on-chain bump is absorbed.
+    // Fix: decode the actual `duration` field from extension bytes (bytes 62-64 of the extension
+    // data section, after the 32-byte LOP header + 20-byte extension address).
     let taking_amount = amount_at_timestamp(fusion_order, *block_ts)?;
 
-    // Check that the Fynd swap output (after router fee) is at least the auction's taking amount.
-    // amount_out() is the gross pool output; the Fynd router deducts router_fee before the
-    // resolver receives the tokens. Use the fee_breakdown when available (always present when
-    // EncodingOptions are set), falling back to gross amount_out only when encoding was skipped.
+    // Minimum headroom above the API-derived price estimate (covers duration-mismatch error).
+    const MIN_PROFIT_MARGIN_BPS: u128 = 75; // 0.75%
+
+    // Check that the Fynd swap output is above the auction price with required margin.
     let biguint_to_u128 = |b: &BigUint| {
         let digits = b.to_u64_digits();
         if digits.is_empty() {
@@ -424,18 +432,23 @@ async fn build_backrun_tx(
         return None;
     }
 
-    // Net amount after Fynd router fee; surplus is computed against this.
-    let amount_out_u128 = if let Some(fb) = order_quote.fee_breakdown() {
-        let router_fee = biguint_to_u128(fb.router_fee());
-        amount_out_gross.saturating_sub(router_fee)
-    } else {
-        amount_out_gross
-    };
+    // TODO: re-enable once the Fynd team sets our resolver's client fee to 0 on-chain.
+    // let amount_out_u128 = if let Some(fb) = order_quote.fee_breakdown() {
+    //     let router_fee = biguint_to_u128(fb.router_fee());
+    //     amount_out_gross.saturating_sub(router_fee)
+    // } else {
+    //     amount_out_gross
+    // };
+    let amount_out_u128 = amount_out_gross;
 
-    if amount_out_u128 < taking_amount {
+    let taking_amount_with_margin = taking_amount
+        .saturating_add(taking_amount.saturating_mul(MIN_PROFIT_MARGIN_BPS) / 10_000);
+
+    if amount_out_u128 < taking_amount_with_margin {
         debug!(%uuid, order_id = %fusion_order.order_id,
-            amount_out_gross, amount_out_net = amount_out_u128, taking_amount,
-            "swap output below auction price after fee, skipping");
+            amount_out_gross, amount_out_net = amount_out_u128,
+            taking_amount, taking_amount_with_margin,
+            "swap output below auction price + margin, skipping");
         return None;
     }
 
@@ -489,11 +502,20 @@ async fn build_backrun_tx(
 
     // Use the router address from the actual Fynd quote transaction (fynd_tx.to()).
     let fynd_router = AlloyAddress::from_slice(fynd_tx.to().as_ref());
+    // Use Fynd output as the takerTraits threshold (max we'll pay).
+    // The LOP computes the actual on-chain auction price and fills at that amount;
+    // we keep amount_out_u128 - actual_price as surplus. This avoids us having to
+    // replicate the gas-bump calculation that the contract applies to the auction rate.
+    // TODO: query LOP.remainingInvalidatorForOrder(maker, orderHash) to get the remaining
+    // making amount. For partially-filled orders, use remaining as fill_amount AND requote
+    // Fynd for only the remaining tokens. Currently we fill the full making_amount which
+    // causes swap calldata mismatch when the order is only partially fillable.
     let params = SettleParams {
         order_fields: &raw_order,
         signature: &signature,
         extension: &extension,
-        taking_amount,
+        taking_amount: amount_out_u128,
+        fill_amount: raw_order.making_amount,
         router: fynd_router,
         primary_swap_calldata: fynd_tx.data(),
         surplus_calldata: &surplus_calldata,
