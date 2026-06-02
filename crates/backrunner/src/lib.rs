@@ -28,7 +28,7 @@ mod encode_test;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use alloy::primitives::Address as AlloyAddress;
+use alloy::primitives::{Address as AlloyAddress, U256};
 
 use abi::{build_settle_calldata, RawOrderFields, SettleParams};
 use builder_types::{BackrunCandidate, BackrunTx, BlockEnv, BuildEvent, ExecutedTx, PostState, RawTx};
@@ -39,7 +39,7 @@ use fynd_core::{
     SolverBuildError,
 };
 use num_bigint::BigUint;
-use order::{amount_at_timestamp, is_gtc_order, FusionOrder};
+use order::{amount_at_timestamp, compute_gas_bump, is_gtc_order, FusionOrder};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, warn};
 use tycho_simulation::tycho_client::feed::BlockHeader;
@@ -103,6 +103,15 @@ struct PendingIteration {
 }
 
 /// Consumes [`BuildEvent`]s from a block builder and publishes [`BackrunCandidate`]s.
+/// 1inch LOP v4 on Ethereum mainnet.
+const LOP_V4: AlloyAddress =
+    alloy::primitives::address!("111111125421cA6dc452d289314280a0f8842A65");
+
+/// `remainingInvalidatorForOrder(address,bytes32)` selector on LOP v4.
+/// Returns the remaining making amount for partially-fillable orders.
+/// Returns 0 if fully filled/cancelled, U256::MAX if never partially filled.
+const REMAINING_SELECTOR: [u8; 4] = [0x10, 0xad, 0x2c, 0x8b];
+
 pub struct Backrunner {
     solver: Solver,
     pending: tokio::sync::Mutex<PendingBlockProcessor>,
@@ -110,6 +119,8 @@ pub struct Backrunner {
     orders_rx: watch::Receiver<Arc<Vec<FusionOrder>>>,
     pub(crate) resolver_address: AlloyAddress,
     pub(crate) slippage: f64,
+    /// RPC URL for direct on-chain queries (remaining amount, etc.).
+    rpc_url: String,
 }
 
 impl Backrunner {
@@ -123,7 +134,7 @@ impl Backrunner {
         let builder = FyndBuilder::new(
             chain,
             config.tycho_url,
-            config.rpc_url,
+            config.rpc_url.clone(),
             config.protocols,
             config.min_tvl,
         )
@@ -154,6 +165,7 @@ impl Backrunner {
             orders_rx,
             resolver_address: config.resolver_address,
             slippage: config.slippage,
+            rpc_url: config.rpc_url.clone(),
         })
     }
 
@@ -223,7 +235,12 @@ async fn run_orderbook(
                 if let Some(view) = market_data.try_read_blocking() {
                     patch_decimals_from_registry(&mut filtered, view.token_registry_ref());
                 }
-                debug!(order_count = filtered.len(), "orderbook refreshed");
+                let max_bump = filtered.iter()
+                    .map(|o| o.auction_start_amount.saturating_sub(o.auction_end_amount)
+                        .saturating_mul(10_000) / o.auction_end_amount.max(1))
+                    .max()
+                    .unwrap_or(0);
+                debug!(order_count = filtered.len(), max_init_bump_bps = max_bump, "orderbook refreshed");
                 if orders_tx.send(Arc::new(filtered)).is_err() {
                     break;
                 }
@@ -324,7 +341,54 @@ async fn evaluate_backrun(
         return None;
     }
 
-    let quote = match try_evaluate(backrunner, uuid, &iter, &active).await {
+    // Query on-chain remaining making amount for each active order (concurrent).
+    // This detects partially-filled orders so we quote Fynd for the correct amount.
+    let rpc = backrunner.rpc_url.clone();
+    let remaining_amounts: Vec<u128> =
+        futures::future::join_all(active.iter().map(|o| {
+            let rpc = rpc.clone();
+            async move { query_remaining_making_amount(&rpc, o).await }
+        }))
+        .await;
+
+    // Build an adjusted FusionOrder per active order using the on-chain remaining amount.
+    // Orders where remaining = 0 (fully filled/cancelled) are dropped.
+    let adjusted: Vec<FusionOrder> = active
+        .iter()
+        .zip(remaining_amounts.iter())
+        .filter_map(|(&order, &remaining)| {
+            if remaining == 0 {
+                debug!(order_id = %order.order_id, "order fully filled on-chain, skipping");
+                return None;
+            }
+            if remaining < order.making_amount {
+                debug!(
+                    order_id = %order.order_id,
+                    making_amount = order.making_amount,
+                    remaining,
+                    "partial fill detected — quoting Fynd for remaining amount",
+                );
+            }
+            // Use min(remaining, making_amount) as the fill amount for Fynd.
+            Some(FusionOrder { making_amount: remaining.min(order.making_amount), ..order.clone() })
+        })
+        .collect();
+
+    if adjusted.is_empty() {
+        debug!(%uuid, "all active orders are fully filled on-chain");
+        return None;
+    }
+
+    let adjusted_refs: Vec<&FusionOrder> = adjusted.iter().collect();
+
+    // Build a map from order_id → remaining amount for use during settlement.
+    let remaining_map: HashMap<&str, u128> = active
+        .iter()
+        .zip(remaining_amounts.iter())
+        .map(|(&o, &r)| (o.order_id.as_str(), r.min(o.making_amount)))
+        .collect();
+
+    let quote = match try_evaluate(backrunner, uuid, &iter, &adjusted_refs).await {
         Ok(Some(q)) => q,
         Ok(None) => {
             debug!(%uuid, "parent block not yet confirmed, skipping");
@@ -336,7 +400,7 @@ async fn evaluate_backrun(
         }
     };
 
-    // Build a map from order_id → FusionOrder for fast lookup.
+    // Build a map from order_id → ORIGINAL FusionOrder for taking_amount computation.
     let order_map: HashMap<&str, &FusionOrder> =
         active.iter().map(|o| (o.order_id.as_str(), *o)).collect();
 
@@ -346,7 +410,7 @@ async fn evaluate_backrun(
         base_fee: iter.block.base_fee_per_gas,
         block_number: iter.block.block_number,
         solve_time_ms: quote.solve_time_ms(),
-        orders_quoted: active.len(),
+        orders_quoted: adjusted.len(),
         backrunner,
     };
 
@@ -355,9 +419,13 @@ async fn evaluate_backrun(
     for order_quote in quote.orders() {
         let Some(fynd_tx) = order_quote.transaction() else { continue };
         let Some(&fusion_order) = order_map.get(order_quote.order_id()) else { continue };
+        let fill_amount = remaining_map
+            .get(order_quote.order_id())
+            .copied()
+            .unwrap_or(fusion_order.making_amount);
 
         if let Some(backrun_tx) =
-            build_backrun_tx(&ctx, fusion_order, order_quote, fynd_tx).await
+            build_backrun_tx(&ctx, fusion_order, order_quote, fynd_tx, fill_amount).await
         {
             backrun_txs.push(backrun_tx);
         }
@@ -393,24 +461,60 @@ async fn build_backrun_tx(
     fusion_order: &FusionOrder,
     order_quote: &OrderQuote,
     fynd_tx: &fynd_core::Transaction,
+    fill_amount: u128,
 ) -> Option<BackrunTx> {
     let BackrunContext { uuid, block_ts, base_fee, block_number, solve_time_ms, orders_quoted, backrunner } = ctx;
-    // Two sources of systematic under-estimation of the on-chain Dutch-auction price:
+    // Systematic under-estimation sources (both mitigated below):
     //
-    // 1. GAS-BUMP: The extension computes totalBump = auctionBump + gasBump where
-    //    gasBump = gasBumpEstimate × block.basefee / gasPriceEstimate. The API does not
-    //    expose these params so we ignore gas_bump. At real basefees this adds ~1-2% to the
-    //    taking amount. The smoke-test eth_call uses baseFeePerGas=0 to neutralise this.
+    // 1. GAS-BUMP: extension adds gasBump = gasBumpEstimate × basefee / gasPriceEstimate.
+    //    Smoke-test: neutralised by BlockOverrides.baseFeePerGas=0.
     //
-    // 2. DURATION MISMATCH: The API's auctionEndDate reports a shorter auction window (~84s)
-    //    than the on-chain extension actually encodes (~180s). Late in the API window our
-    //    amount_at_timestamp returns floor while on-chain the auction still carries ~0.5% bump.
+    // 2. AUCTION-BREAKPOINT RESIDUAL (~21 bps): the API's `points` array may not exactly
+    //    match the on-chain extension's breakpoints. Covered by MIN_PROFIT_MARGIN_BPS.
+    //    (API duration mismatch is fixed in client.rs by decoding duration from extension.)
     //
-    // MIN_PROFIT_MARGIN_BPS covers mismatch (2): require the Fynd output to exceed our
-    // API-derived estimate by at least 75 bps so the residual ~0.5% on-chain bump is absorbed.
-    // Fix: decode the actual `duration` field from extension bytes (bytes 62-64 of the extension
-    // data section, after the 32-byte LOP header + 20-byte extension address).
-    let taking_amount = amount_at_timestamp(fusion_order, *block_ts)?;
+    // For partial fills (fill_amount < full making_amount): the LOP only fills fill_amount
+    // tokens; scale taking_amount proportionally so the profitability check is correct.
+    let taking_amount_auction_only = amount_at_timestamp(fusion_order, *block_ts)?;
+
+    // Include gas_bump in the taking amount estimate. On-chain, the Fusion extension computes:
+    //   gasBump = gasBumpEstimate × baseFee_wei / (gasPriceEstimate × 10^6)
+    //   taking  = floor × (BASE + auctionBump + gasBump) / BASE
+    //
+    // The base_fee BlockOverride in eth_call is not honoured by Alchemy (the actual block
+    // baseFee is used instead), so we must account for the gas bump explicitly here.
+    let gas_bump = compute_gas_bump(fusion_order, *base_fee);
+    // Scale: taking_gas_extra = floor × gasBump / BASE.  We add it to the interpolated amount.
+    let gas_bump_taking = fusion_order.auction_end_amount
+        .saturating_mul(gas_bump)
+        .saturating_add(9_999_999)
+        / 10_000_000;
+
+    let taking_amount_full = taking_amount_auction_only.saturating_add(gas_bump_taking);
+    let taking_amount = if fill_amount < fusion_order.making_amount && fusion_order.making_amount > 0 {
+        taking_amount_full
+            .saturating_mul(fill_amount)
+            / fusion_order.making_amount
+    } else {
+        taking_amount_full
+    };
+
+    // Diagnostic: log auction state so we can compare off-chain estimate with on-chain result.
+    let elapsed_secs = block_ts.saturating_sub(fusion_order.auction_start_time);
+    debug!(%uuid, order_id = %fusion_order.order_id,
+        floor = fusion_order.auction_end_amount,
+        start_amount = fusion_order.auction_start_amount,
+        duration = fusion_order.auction_duration_secs,
+        start_time = fusion_order.auction_start_time,
+        block_ts,
+        elapsed_secs,
+        base_fee,
+        gas_bump,
+        gas_bump_taking,
+        points_count = fusion_order.points.len(),
+        taking_estimate = taking_amount,
+        "auction price estimate",
+    );
 
     // Minimum headroom above the API-derived price estimate (covers duration-mismatch error).
     // With the extension-duration fix in client.rs, the duration-mismatch error is eliminated.
@@ -456,6 +560,14 @@ async fn build_backrun_tx(
             "swap output below auction price + margin, skipping");
         return None;
     }
+
+    // Log that this order passed the profitability filter, with the margin vs estimate.
+    let margin_bps = amount_out_u128.saturating_sub(taking_amount) * 10_000 / taking_amount.max(1);
+    debug!(%uuid, order_id = %fusion_order.order_id,
+        amount_out = amount_out_u128, taking_estimate = taking_amount,
+        margin_bps,
+        "order passed profitability filter — will attempt eth_call",
+    );
 
     // Get secondary Fynd quote for surplus → WETH (async, best-effort).
     let surplus_amount = amount_out_u128.saturating_sub(taking_amount);
@@ -511,16 +623,14 @@ async fn build_backrun_tx(
     // The LOP computes the actual on-chain auction price and fills at that amount;
     // we keep amount_out_u128 - actual_price as surplus. This avoids us having to
     // replicate the gas-bump calculation that the contract applies to the auction rate.
-    // TODO: query LOP.remainingInvalidatorForOrder(maker, orderHash) to get the remaining
-    // making amount. For partially-filled orders, use remaining as fill_amount AND requote
-    // Fynd for only the remaining tokens. Currently we fill the full making_amount which
-    // causes swap calldata mismatch when the order is only partially fillable.
     let params = SettleParams {
         order_fields: &raw_order,
         signature: &signature,
         extension: &extension,
         taking_amount: amount_out_u128,
-        fill_amount: raw_order.making_amount,
+        // fill_amount: use on-chain remaining amount so the LOP does not scale our threshold.
+        // For full orders (remaining == making_amount), this equals making_amount.
+        fill_amount: alloy::primitives::U256::from(fill_amount),
         router: fynd_router,
         primary_swap_calldata: fynd_tx.data(),
         surplus_calldata: &surplus_calldata,
@@ -705,6 +815,88 @@ fn parse_address(hex_str: &str) -> anyhow::Result<TychoBytes> {
         .map_err(|e| anyhow::anyhow!("hex-decode failed for {hex_str}: {e}"))?;
     anyhow::ensure!(raw.len() == 20, "expected 20 bytes, got {}: {hex_str}", raw.len());
     Ok(TychoBytes::from(raw))
+}
+
+/// Calls `LOP.remainingInvalidatorForOrder(maker, orderHash)` via a raw JSON-RPC
+/// `eth_call` and returns the remaining making amount that can still be filled.
+///
+/// - Returns `full_making` when the order is fresh (LOP returns `U256::MAX`) or on error.
+/// - Returns `0` when the order is fully filled or cancelled.
+/// - Returns the actual remaining making amount otherwise (clamped to `full_making`).
+async fn query_remaining_making_amount(rpc_url: &str, order: &FusionOrder) -> u128 {
+    let full = order.making_amount;
+
+    // Parse maker address
+    let maker: AlloyAddress = match order.maker_address.parse() {
+        Ok(a) => a,
+        Err(_) => return full,
+    };
+
+    // Parse order hash (bytes32)
+    let hash_str = order.order_id.strip_prefix("0x").unwrap_or(&order.order_id);
+    let hash_bytes = match hex::decode(hash_str) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return full,
+    };
+
+    // ABI-encode: remainingInvalidatorForOrder(address maker, bytes32 orderHash)
+    // = selector(4B) + address_padded(32B) + bytes32(32B)
+    let mut calldata = Vec::with_capacity(68);
+    calldata.extend_from_slice(&REMAINING_SELECTOR);
+    calldata.extend_from_slice(&[0u8; 12]); // address left-padded to 32 bytes
+    calldata.extend_from_slice(maker.as_slice());
+    calldata.extend_from_slice(&hash_bytes);
+
+    // Build raw JSON-RPC eth_call payload (no alloy provider needed)
+    let lop_hex = format!("0x{}", hex::encode(LOP_V4.as_slice()));
+    let data_hex = format!("0x{}", hex::encode(&calldata));
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": lop_hex, "data": data_hex}, "latest"],
+        "id": 1
+    });
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return full,
+    };
+
+    let resp = match client.post(rpc_url).json(&body).send().await {
+        Ok(r) => r,
+        Err(_) => return full,
+    };
+
+    let json: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return full,
+    };
+
+    // Parse hex result → U256 → u128
+    let hex_result = match json["result"].as_str() {
+        Some(s) => s.strip_prefix("0x").unwrap_or(s),
+        None => return full,
+    };
+
+    if hex_result.len() < 64 {
+        return full;
+    }
+
+    let raw = match hex::decode(&hex_result[hex_result.len() - 64..]) {
+        Ok(b) => b,
+        Err(_) => return full,
+    };
+
+    let val = U256::from_be_slice(&raw);
+    if val == U256::MAX {
+        full // fresh order: never partially filled
+    } else {
+        let clamped = val.min(U256::from(full));
+        u128::try_from(clamped).unwrap_or(full)
+    }
 }
 
 fn to_tx_input(tx: &ExecutedTx, index: u64) -> TxInput {

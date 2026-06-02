@@ -198,13 +198,19 @@ async fn run_block_loop(
         };
         let block_number = confirmed.number() + 1;
         let block_timestamp = confirmed.timestamp() + 12;
-        tracing::info!(block_number, "new block — issuing iteration");
+
+        // Read actual baseFee from the confirmed block so our gas-bump estimate matches
+        // what the eth_call will see.  Alchemy ignores the base_fee BlockOverride in
+        // eth_call, so the gasBump calculation in the on-chain extension always uses the
+        // real block baseFee — our profitability estimate must match this exactly.
+        let base_fee_per_gas = fetch_base_fee(&provider, confirmed.number()).await;
+        tracing::info!(block_number, base_fee_gwei = base_fee_per_gas / 1_000_000_000, "new block — issuing iteration");
 
         let uuid = Uuid::new_v4();
         let block_env = BlockEnv {
             block_number,
             block_timestamp,
-            base_fee_per_gas: 0,
+            base_fee_per_gas,
         };
 
         if event_tx
@@ -257,15 +263,13 @@ async fn validate_candidate_txs(
     resolver_addr: AlloyAddress,
     resolver_bytecode: &Option<AlloyBytes>,
 ) {
-    // Set baseFeePerGas = 0 in the eth_call simulation so the Dutch auction extension
-    // computes gas_bump = 0. This aligns the on-chain taking amount with our off-chain
-    // `amount_at_timestamp` estimate (which also ignores gas_bump). Without this override
-    // the node uses the confirmed block's actual basefee, causing the on-chain price to be
-    // ~1% above our estimate and causing spurious TakingAmountTooHigh reverts.
-    // Note: actual fills (not smoke test) should use the real pending-block basefee.
+    // Override the block timestamp so the Dutch auction sees the pending block's time.
+    // Note: the base_fee BlockOverride is intentionally NOT set here — Alchemy ignores
+    // it for eth_call, so the on-chain gasBump is computed from the actual confirmed
+    // block's baseFee.  Our profitability estimate in build_backrun_tx already accounts
+    // for this via compute_gas_bump(), so both sides are consistent.
     let block_overrides = alloy::rpc::types::BlockOverrides {
         time: Some(block_timestamp),
-        base_fee: Some(alloy::primitives::U256::ZERO),
         ..Default::default()
     };
 
@@ -321,7 +325,6 @@ async fn trace_call(
     opts.state_overrides = build_state_override(resolver_addr, resolver_bytecode);
     opts.block_overrides = Some(alloy::rpc::types::BlockOverrides {
         time: Some(block_timestamp),
-        base_fee: Some(alloy::primitives::U256::ZERO),
         ..Default::default()
     });
     match provider.debug_trace_call(tx_req, alloy::rpc::types::BlockId::latest(), opts).await {
@@ -410,4 +413,20 @@ fn executor_role_has_role_slot(account: AlloyAddress) -> B256 {
 fn read_confirmed_block_info(market_data: &MarketData) -> Option<BlockInfo> {
     let view = market_data.try_read_blocking()?;
     view.last_updated().cloned()
+}
+
+/// Fetches the baseFee (in wei) from the given confirmed block number.
+///
+/// Falls back to 0 on any error.  The baseFee is used so our gas-bump estimate matches
+/// what the on-chain Fusion extension computes during eth_call.
+async fn fetch_base_fee(provider: &impl Provider, block_number: u64) -> u64 {
+    let block_id = alloy::rpc::types::BlockId::number(block_number);
+    match provider.get_block(block_id).await {
+        Ok(Some(b)) => b
+            .header
+            .base_fee_per_gas
+            .and_then(|fee| u64::try_from(fee).ok())
+            .unwrap_or(0),
+        _ => 0,
+    }
 }

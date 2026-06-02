@@ -160,22 +160,28 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
         bail!("zero-length auction");
     }
 
-    // The API's auctionEndDate is consistently ~96 seconds shorter than the duration
-    // encoded in the 1inch Fusion extension bytes.  Using the API duration causes
-    // amount_at_timestamp to return floor prematurely, making profitable late-auction fills
-    // appear unprofitable.  Override with the on-chain value when it can be decoded.
+    // The 1inch API's auction parameters (auctionStartDate, auctionEndDate, initialRateBump)
+    // don't always match what's encoded in the Fusion extension bytes, causing systematic
+    // errors in amount_at_timestamp.  Decode the canonical values directly from the extension.
     //
-    // Extension layout (offsets from start of raw hex after "0x"):
+    // Extension layout (hex char offsets, no "0x" prefix):
     //   [0:64]   32-byte LOP header (section lengths)
     //   [64:104] 20-byte Dutch-auction extension address
     //   [104:110] gasBumpEstimate  (uint24)
-    //   [110:116] gasPriceEstimate (uint24)
-    //   [116:124] startTime        (uint32)
+    //   [110:118] gasPriceEstimate (uint32)  ← 4 bytes
+    //   [118:126] startTime        (uint32)
     //   [126:132] duration         (uint24)  ← 180 s for typical orders
-    let auction_duration_secs =
-        decode_extension_duration(&item.extension).unwrap_or(api_duration_secs);
+    //   [132:138] initialRateBump  (uint24)
+    let ext_params = decode_extension_params(&item.extension);
+    let auction_start_ts = ext_params.as_ref().map(|p| p.start_time).unwrap_or(auction_start_ts);
+    let auction_duration_secs = ext_params.as_ref().map(|p| p.duration).unwrap_or(api_duration_secs);
+    let eff_initial_rate_bump = ext_params.as_ref()
+        .map(|p| u128::from(p.init_rate_bump))
+        .unwrap_or_else(|| u128::from(item.initial_rate_bump));
+    let gas_bump_estimate       = ext_params.as_ref().map(|p| p.gas_bump_estimate).unwrap_or(0);
+    let gas_price_estimate_mwei = ext_params.as_ref().map(|p| p.gas_price_estimate_mwei).unwrap_or(0);
 
-    let auction_start_amount = apply_rate_bump(taking_amount, u128::from(item.initial_rate_bump));
+    let auction_start_amount = apply_rate_bump(taking_amount, eff_initial_rate_bump);
 
     let mut cumulative_delay: u64 = 0;
     let mut points = Vec::with_capacity(item.points.len());
@@ -215,6 +221,8 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
         to_token_decimals: to_decimals,
         from_token_usd_rate: item.from_token_to_usdc_rate.unwrap_or(0.0),
         to_token_usd_rate: item.to_token_to_usdc_rate.unwrap_or(0.0),
+        gas_bump_estimate,
+        gas_price_estimate_mwei,
         signature: item.signature,
         extension: item.extension,
         salt: item.order.salt,
@@ -224,26 +232,41 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
     })
 }
 
-/// Decodes the `duration` field from a 1inch Fusion order extension hex string.
+/// Decoded parameters from a 1inch Fusion Dutch-auction extension.
+struct ExtensionParams {
+    start_time: u64,
+    duration: u64,
+    init_rate_bump: u32,
+    gas_bump_estimate: u32,
+    gas_price_estimate_mwei: u32,
+}
+
+/// Decodes auction parameters from a 1inch Fusion extension hex string.
 ///
-/// Returns `None` if the extension is too short, malformed, or encodes duration = 0.
-/// The duration is stored at bytes 63-65 (uint24, big-endian) of the raw extension:
-///   [0:32]   LOP section-length header (8 × uint32)
+/// Returns `None` if the extension is too short, malformed, or encodes `duration = 0`.
+/// Layout (byte offsets, after stripping optional "0x"):
+///   [0:32]   LOP section-length header
 ///   [32:52]  Dutch-auction extension address (20 bytes)
-///   [52:55]  gasBumpEstimate  (uint24)
-///   [55:59]  gasPriceEstimate (uint32) ← 4 bytes
-///   [59:63]  startTime        (uint32)
-///   [63:66]  duration         (uint24) ← decoded here; typically 180 s
-fn decode_extension_duration(extension_hex: &str) -> Option<u64> {
+///   [52:55]  gasBumpEstimate  (uint24)  → hex chars [104:110]
+///   [55:59]  gasPriceEstimate (uint32)  → hex chars [110:118]
+///   [59:63]  startTime        (uint32)  → hex chars [118:126]
+///   [63:66]  duration         (uint24)  → hex chars [126:132]
+///   [66:69]  initialRateBump  (uint24)  → hex chars [132:138]
+fn decode_extension_params(extension_hex: &str) -> Option<ExtensionParams> {
     let raw = extension_hex.strip_prefix("0x").unwrap_or(extension_hex);
-    // Need at least 66 bytes = 132 hex chars
-    if raw.len() < 132 {
+    if raw.len() < 138 {
         return None;
     }
-    // byte offsets: 52+3+4+4 = 63; hex char offset = 63*2 = 126
-    let dur_hex = &raw[126..132]; // bytes 63-65 as 6 hex chars
-    let dur = u64::from_str_radix(dur_hex, 16).ok()?;
-    if dur == 0 { None } else { Some(dur) }
+    let gas_bump_estimate       = u32::from_str_radix(&raw[104..110], 16).ok()?;
+    let gas_price_estimate_mwei = u32::from_str_radix(&raw[110..118], 16).ok()?;
+    let start_time              = u64::from_str_radix(&raw[118..126], 16).ok()?;
+    let duration                = u64::from_str_radix(&raw[126..132], 16).ok()?;
+    let init_rate_bump          = u32::from_str_radix(&raw[132..138], 16).ok()?;
+    if duration == 0 {
+        None
+    } else {
+        Some(ExtensionParams { start_time, duration, init_rate_bump, gas_bump_estimate, gas_price_estimate_mwei })
+    }
 }
 
 fn parse_iso_timestamp(s: &str) -> anyhow::Result<u64> {

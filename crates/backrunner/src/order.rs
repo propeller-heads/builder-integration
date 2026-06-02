@@ -39,6 +39,13 @@ pub struct FusionOrder {
     pub from_token_usd_rate: f64,
     /// USD value of one whole `to_token` at order creation.
     pub to_token_usd_rate: f64,
+    /// Extension gasBumpEstimate (uint24): factor to multiply by baseFee/gasPriceEst.
+    ///
+    /// On-chain: gasBump = gasBumpEstimate × baseFee_wei / (gasPriceEstimate × 10^6).
+    /// Included in the taking-amount computation so the profitability check is accurate.
+    pub gas_bump_estimate: u32,
+    /// Extension gasPriceEstimate (uint32) in units of 10^6 wei (Mwei).
+    pub gas_price_estimate_mwei: u32,
     /// EIP-712 maker signature (65 bytes, `0x`-prefixed hex).
     pub signature: String,
     /// Fusion Dutch-auction extension bytes (`0x`-prefixed hex, may be `"0x"` if empty).
@@ -61,6 +68,22 @@ pub fn is_gtc_order(order: &FusionOrder) -> bool {
     const GTC_DURATION_THRESHOLD_SECS: u64 = 3_600;
     order.auction_start_amount <= order.auction_end_amount
         && order.auction_duration_secs > GTC_DURATION_THRESHOLD_SECS
+}
+
+/// Computes the gas-bump rate for an order given the pending block's base fee.
+///
+/// On-chain formula: `gasBump = gasBumpEstimate × baseFee_wei / (gasPriceEstimate × 10^6)`
+/// This additional bump is added to the auction bump when computing `taking_amount`.
+///
+/// Returns 0 when the order has no gas-bump configured (`gas_price_estimate_mwei == 0`).
+pub fn compute_gas_bump(order: &FusionOrder, base_fee_wei: u64) -> u128 {
+    let gas_price_scaled = u64::from(order.gas_price_estimate_mwei) * 1_000_000;
+    if gas_price_scaled == 0 {
+        return 0;
+    }
+    u128::from(order.gas_bump_estimate)
+        .saturating_mul(u128::from(base_fee_wei))
+        / u128::from(gas_price_scaled)
 }
 
 /// Returns the minimum required output amount A(t) at `unix_ts`.
@@ -131,6 +154,8 @@ mod tests {
             to_token_decimals: 18,
             from_token_usd_rate: 1.0,
             to_token_usd_rate: 1.0,
+            gas_bump_estimate: 0,
+            gas_price_estimate_mwei: 0,
             signature: "0x00".to_string(),
             extension: "0x".to_string(),
             salt: "0".to_string(),
