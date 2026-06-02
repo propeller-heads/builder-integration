@@ -396,8 +396,6 @@ async fn evaluate_backrun(
         return None;
     }
 
-    log_extension_distribution(uuid, &active);
-
     // Query on-chain remaining making amount for each active order (concurrent).
     // This detects partially-filled orders so we quote Fynd for the correct amount.
     let rpc = backrunner.rpc_url.clone();
@@ -499,24 +497,6 @@ async fn evaluate_backrun(
     })
 }
 
-/// Logs the distribution of Dutch-auction extension contracts across active orders.
-///
-/// Extension address lives at hex chars [64:104] of the extension field.
-/// One log line per distinct address so we can verify order homogeneity.
-fn log_extension_distribution(uuid: Uuid, orders: &[&FusionOrder]) {
-    let mut ext_counts: HashMap<String, usize> = HashMap::new();
-    for order in orders {
-        let raw = order.extension.strip_prefix("0x").unwrap_or(&order.extension);
-        let addr = if raw.len() >= 104 { raw[64..104].to_lowercase() } else { "unknown".to_owned() };
-        *ext_counts.entry(addr).or_insert(0) += 1;
-    }
-    let total = orders.len();
-    for (addr, count) in &ext_counts {
-        debug!(%uuid, extension_contract = %addr, count, total, pct = count * 100 / total,
-            "extension contract distribution");
-    }
-}
-
 /// Iteration-level context shared across all per-order calls inside [`evaluate_backrun`].
 struct BackrunContext<'a> {
     uuid: Uuid,
@@ -584,12 +564,17 @@ async fn build_backrun_tx(
     // Pre-flight: static-call extension.getTakingAmount to get the exact on-chain price.
     // Our Rust estimate can diverge from the contract due to arithmetic differences or
     // resolver fees added inside getTakingAmount. Checking here avoids failed fill simulations.
+    //
+    // We pass the pending block timestamp so the extension sees the same elapsed time as our
+    // off-chain estimate — without it the eth_call runs at the confirmed block timestamp
+    // (12 s earlier), which can land before the auction start and return the full start price.
     let onchain_taking = query_onchain_taking_amount(
         &backrunner.rpc_url,
         fusion_order,
         fill_amount,
         fill_amount,
         backrunner.resolver_address,
+        *block_ts,
     )
     .await;
 
@@ -598,6 +583,9 @@ async fn build_backrun_tx(
             debug!(%uuid, order_id = %fusion_order.order_id,
                 amount_out, onchain_taking = onchain,
                 shortfall = onchain.saturating_sub(amount_out),
+                taking_estimate = taking_amount,
+                extension_hex = %fusion_order.extension,
+                block_ts, base_fee,
                 "fynd output below on-chain taking amount, skipping");
             return None;
         }
@@ -605,6 +593,7 @@ async fn build_backrun_tx(
             debug!(%uuid, order_id = %fusion_order.order_id,
                 amount_out, onchain_taking = onchain,
                 surplus = amount_out.saturating_sub(onchain),
+                taking_estimate = taking_amount,
                 "on-chain taking amount verified, proceeding to fill");
         }
         None => debug!(%uuid, order_id = %fusion_order.order_id,
@@ -939,6 +928,7 @@ async fn query_onchain_taking_amount(
     fill_making_amount: u128,
     remaining_making_amount: u128,
     resolver: AlloyAddress,
+    pending_block_ts: u64,
 ) -> Option<u128> {
     use alloy::sol_types::{SolCall, SolError as _};
     use std::str::FromStr;
@@ -1006,10 +996,19 @@ async fn query_onchain_taking_amount(
     let lop_hex   = format!("0x{}", hex::encode(lop_addr.as_slice()));
     let data_hex  = format!("0x{}", hex::encode(simulate_call.abi_encode()));
 
+    // Pass the pending block timestamp so the extension sees the same elapsed time our
+    // off-chain estimate used.  Without this, eth_call runs at the confirmed block
+    // timestamp (≈12 s earlier), which can make the auction appear not yet started and
+    // return the full start price — inflating the required taking amount.
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "eth_call",
-        "params": [{"to": lop_hex, "data": data_hex}, "latest"],
+        "params": [
+            {"to": lop_hex, "data": data_hex},
+            "latest",
+            {},
+            {"time": format!("0x{:x}", pending_block_ts)}
+        ],
         "id": 1
     });
 

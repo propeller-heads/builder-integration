@@ -228,4 +228,157 @@ mod tests {
             Some(1_000_500_000_000_000_000u128)
         );
     }
+
+    // ── Real-order regression tests ──────────────────────────────────────────
+    //
+    // Parameters decoded from live extension bytes observed in smoke run 3
+    // (block 25230553, June 2026).  These anchor the formula to on-chain ground
+    // truth and guard against silent arithmetic regressions.
+
+    /// FABA→WETH order captured at block 25230553.
+    ///
+    /// Extension params decoded from TakingAmountData:
+    ///   startTime=1780413608, duration=360s, initialRateBump=695823
+    ///   floor=13_632_559_937_529_719 (order.takingAmount)
+    ///   start_amount=apply_rate_bump(floor, 695823)=14_581_144_812_870_894
+    ///
+    /// Ground truth: smoke run 3 log with base_fee=0 → gas_bump=0.
+    ///   taking_estimate=14573239938909718 at pending_ts=1780413611 (elapsed=3s)
+    fn faba_order() -> FusionOrder {
+        FusionOrder {
+            order_id: "0x9d7a1175ffd8e3b62e32c68657a1fa7bc08a7d8f07161a31ce9ce14560448c54".into(),
+            from_token: "0xfaba6f8e4a5e8ab82f62fe7c39859fa577269be3".into(),
+            to_token: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),
+            making_amount: 307_671_843_799_523_540,
+            auction_start_amount: 14_581_144_812_870_894,
+            auction_end_amount:   13_632_559_937_529_719,
+            auction_duration_secs: 360,
+            auction_start_time:    1_780_413_608,
+            points: vec![],
+            from_token_symbol: Some("FABA".into()),
+            to_token_symbol:   Some("WETH".into()),
+            from_token_decimals: 18,
+            to_token_decimals:   18,
+            from_token_usd_rate: 0.0,
+            to_token_usd_rate:   0.0,
+            gas_bump_estimate:       343_213,
+            gas_price_estimate_mwei:   2_076,
+            signature: "0x".into(),
+            extension: "0x".into(),
+            salt: "0".into(),
+            maker_address:    "0x0000000000000000000000000000000000000000".into(),
+            receiver_address: "0x0000000000000000000000000000000000000000".into(),
+            maker_traits: "0".into(),
+        }
+    }
+
+    #[test]
+    fn faba_auction_price_at_elapsed_3s() {
+        // pending_ts = startTime + 3 = 1_780_413_611
+        assert_eq!(
+            amount_at_timestamp(&faba_order(), 1_780_413_611),
+            Some(14_573_239_938_909_718),
+        );
+    }
+
+    #[test]
+    fn faba_before_auction_start_returns_none() {
+        // confirmed block 25230552 had timestamp=1780413599, which is 9s BEFORE startTime.
+        // This replicates what the on-chain eth_call at "latest" would see — the auction
+        // hasn't started, so the extension should be called with timestamp override instead.
+        assert_eq!(amount_at_timestamp(&faba_order(), 1_780_413_599), None);
+    }
+
+    #[test]
+    fn faba_gas_bump_at_base_fee() {
+        // Base fee from confirmed block 25230552: 1_871_798_811 wei.
+        let bump = compute_gas_bump(&faba_order(), 1_871_798_811);
+        assert_eq!(bump, 309_453);
+        let taking = faba_order().auction_end_amount
+            .saturating_mul(bump)
+            .saturating_add(9_999_999)
+            / 10_000_000;
+        assert_eq!(taking, 421_863_657_034_839);
+    }
+
+    #[test]
+    fn faba_full_estimate_at_elapsed_3s() {
+        // Combined auction price + gas bump — the value compared against amount_out.
+        let order = faba_order();
+        let block_ts = 1_780_413_611_u64;
+        let base_fee = 1_871_798_811_u64;
+
+        let auction_price = amount_at_timestamp(&order, block_ts).unwrap();
+        let gas_bump      = compute_gas_bump(&order, base_fee);
+        let gas_bump_tak  = order.auction_end_amount
+            .saturating_mul(gas_bump)
+            .saturating_add(9_999_999)
+            / 10_000_000;
+        assert_eq!(auction_price + gas_bump_tak, 14_995_103_595_944_557);
+    }
+
+    /// WETH→USDT order from encode_test.rs (block 25222660).
+    ///
+    /// Extension params decoded from TakingAmountData:
+    ///   startTime=1780318371, duration=180s, initialRateBump=53347
+    ///   floor=1_327_889_927, start_amount=1_334_973_822
+    ///   gasBumpEstimate=3080, gasPriceEstimate=336 Mwei
+    fn usdt_order() -> FusionOrder {
+        FusionOrder {
+            order_id: "0xddc5239bef2a6f7afc8967384e209ec5548215abda64e5a68e89e7e0741f2090".into(),
+            from_token: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),
+            to_token:   "0xdac17f958d2ee523a2206206994597c13d831ec7".into(),
+            making_amount: 671_300_000_000_000_000,
+            auction_start_amount: 1_334_973_822,
+            auction_end_amount:   1_327_889_927,
+            auction_duration_secs: 180,
+            auction_start_time:    1_780_318_371,
+            points: vec![],
+            from_token_symbol: Some("WETH".into()),
+            to_token_symbol:   Some("USDT".into()),
+            from_token_decimals: 18,
+            to_token_decimals:    6,
+            from_token_usd_rate: 0.0,
+            to_token_usd_rate:   0.0,
+            gas_bump_estimate:       3_080,
+            gas_price_estimate_mwei:   336,
+            signature: "0x".into(),
+            extension: "0x".into(),
+            salt: "0".into(),
+            maker_address:    "0x0000000000000000000000000000000000000000".into(),
+            receiver_address: "0x0000000000000000000000000000000000000000".into(),
+            maker_traits: "0".into(),
+        }
+    }
+
+    #[test]
+    fn usdt_auction_at_start() {
+        assert_eq!(
+            amount_at_timestamp(&usdt_order(), 1_780_318_371),
+            Some(1_334_973_822),
+        );
+    }
+
+    #[test]
+    fn usdt_auction_at_elapsed_27s() {
+        // elapsed=27: decay = (1334973822 - 1327889927) * 27 / 180 = 1062584
+        // result = 1334973822 - 1062584 = 1333911238
+        assert_eq!(
+            amount_at_timestamp(&usdt_order(), 1_780_318_398),
+            Some(1_333_911_238),
+        );
+    }
+
+    #[test]
+    fn usdt_auction_at_elapsed_90s() {
+        assert_eq!(
+            amount_at_timestamp(&usdt_order(), 1_780_318_461),
+            Some(1_331_431_875),
+        );
+    }
+
+    #[test]
+    fn usdt_auction_expired_returns_none() {
+        assert_eq!(amount_at_timestamp(&usdt_order(), 1_780_318_551), None);
+    }
 }
