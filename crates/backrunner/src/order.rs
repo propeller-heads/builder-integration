@@ -381,4 +381,123 @@ mod tests {
     fn usdt_auction_expired_returns_none() {
         assert_eq!(amount_at_timestamp(&usdt_order(), 1_780_318_551), None);
     }
+
+    // ── Smoke run 4 — UNI→USDC order, block 25230904 (eth_call SUCCESS) ──────
+    //
+    // Order 0x24d971ccc1964e91b28518779ed29cbcb4496849fd463791b99645f9d01a0c69
+    //   makerAsset: UNI  (0x1f9840a85d5af5bf1d1762f925bdaddc4201f984)
+    //   takerAsset: USDC (0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48)
+    //   floor=60_227_591, start_amount=61_805_862
+    //   startTime=1_780_417_845, duration=360s
+    //   gasBumpEstimate=126_727, gasPriceEstimate=1_433 Mwei
+    //
+    // Extension has TWO auction points (API returns 0 — discrepancy):
+    //   t=24s:  coeff=251_799 → amount=61_744_116
+    //   t=360s: coeff=126_727 → amount=60_990_838  (≈ floor + gas-at-reference-price)
+    //
+    // Ground truth from debug trace (block 25230904, confirmed SUCCESS):
+    //   onchain_taking = 63_030_547  (pending_ts=1_780_417_847, base_fee=1_269_763_641)
+    //
+    // NOTE: our off-chain estimate (62_473_396) is lower than onchain (63_030_547).
+    // The ~535k gap is a resolver-tier fee encoded in the extension's third section
+    // (not yet decoded off-chain).  The `query_onchain_taking_amount` pre-check
+    // handles this correctly; these tests verify the auction-curve arithmetic only.
+
+    fn uni_order_no_pts() -> FusionOrder {
+        FusionOrder {
+            order_id: "0x24d971ccc1964e91b28518779ed29cbcb4496849fd463791b99645f9d01a0c69".into(),
+            from_token: "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984".into(),
+            to_token:   "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+            making_amount:        22_379_390_100_267_360_763,
+            auction_start_amount: 61_805_862,
+            auction_end_amount:   60_227_591,
+            auction_duration_secs: 360,
+            auction_start_time:    1_780_417_845,
+            points: vec![],
+            from_token_symbol:  Some("UNI".into()),
+            to_token_symbol:    Some("USDC".into()),
+            from_token_decimals: 18,
+            to_token_decimals:    6,
+            from_token_usd_rate: 0.0,
+            to_token_usd_rate:   0.0,
+            gas_bump_estimate:        126_727,
+            gas_price_estimate_mwei:    1_433,
+            signature:        "0x".into(),
+            extension:        "0x".into(),
+            salt:             "0".into(),
+            maker_address:    "0x0000000000000000000000000000000000000000".into(),
+            receiver_address: "0x0000000000000000000000000000000000000000".into(),
+            maker_traits:     "0".into(),
+        }
+    }
+
+    fn uni_order_with_pts() -> FusionOrder {
+        FusionOrder {
+            points: vec![
+                AuctionPoint { delay_secs: 24,  amount: 61_744_116 },
+                AuctionPoint { delay_secs: 360, amount: 60_990_838 },
+            ],
+            ..uni_order_no_pts()
+        }
+    }
+
+    #[test]
+    fn uni_gas_bump_at_base_fee() {
+        // base_fee = 1_269_763_641 from block 25230903 (confirmed parent of 25230904)
+        // gas_bump = 126_727 * 1_269_763_641 / (1_433 * 1_000_000) = 112_291
+        let bump = compute_gas_bump(&uni_order_no_pts(), 1_269_763_641);
+        assert_eq!(bump, 112_291);
+    }
+
+    #[test]
+    fn uni_price_at_elapsed_2s_no_points() {
+        // Simple linear (as the 1inch API returns no points for this order).
+        // elapsed=2: decay = (61_805_862 - 60_227_591) * 2 / 360 = 8_768 (floor div)
+        assert_eq!(
+            amount_at_timestamp(&uni_order_no_pts(), 1_780_417_847),
+            Some(61_797_094),
+        );
+    }
+
+    #[test]
+    fn uni_price_at_elapsed_2s_with_ext_points() {
+        // Piecewise with extension-decoded points (segment 0..24s).
+        // decay = (61_805_862 - 61_744_116) * 2 / 24 = 5_145 (floor div)
+        assert_eq!(
+            amount_at_timestamp(&uni_order_with_pts(), 1_780_417_847),
+            Some(61_800_717),
+        );
+    }
+
+    #[test]
+    fn uni_full_estimate_no_points() {
+        // Reproduces the logged taking_estimate=62_473_396 exactly.
+        // smoke run 4: "auction price estimate ... taking_estimate=62473396"
+        let order    = uni_order_no_pts();
+        let block_ts = 1_780_417_847_u64;
+        let base_fee = 1_269_763_641_u64;
+
+        let price    = amount_at_timestamp(&order, block_ts).unwrap();
+        let gas_bump = compute_gas_bump(&order, base_fee);
+        let gas_bump_taking = order.auction_end_amount
+            .saturating_mul(gas_bump)
+            .saturating_add(9_999_999)
+            / 10_000_000;
+        assert_eq!(price + gas_bump_taking, 62_473_396);
+    }
+
+    #[test]
+    fn uni_before_start_returns_none() {
+        // 1s before auction start
+        assert_eq!(amount_at_timestamp(&uni_order_no_pts(), 1_780_417_844), None);
+    }
+
+    #[test]
+    fn uni_expired_returns_none() {
+        // At or after auction end (start + 360s)
+        assert_eq!(
+            amount_at_timestamp(&uni_order_no_pts(), 1_780_417_845 + 360),
+            None,
+        );
+    }
 }
