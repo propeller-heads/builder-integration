@@ -54,6 +54,12 @@ struct Cli {
 
     #[arg(long, env = "SLIPPAGE", default_value_t = 0.005)]
     slippage: f64,
+
+    #[arg(long, env = "ORDERBOOK_INTERVAL_SECS", default_value_t = 12)]
+    orderbook_interval_secs: u64,
+
+    #[arg(long, env = "VERIFY_ONCHAIN_TAKING", default_value_t = false)]
+    verify_onchain_taking: bool,
 }
 
 #[tokio::main]
@@ -75,6 +81,8 @@ async fn main() -> Result<()> {
         chain_id: cli.chain_id,
         resolver_address: cli.resolver_address,
         slippage: cli.slippage,
+        orderbook_interval: Duration::from_secs(cli.orderbook_interval_secs),
+        verify_onchain_taking: cli.verify_onchain_taking,
     };
 
     tracing::info!("building backrunner, waiting for market data...");

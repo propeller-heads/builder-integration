@@ -1,12 +1,64 @@
-//! Client for the 1inch Fusion public orders API.
+//! Client for the 1inch Fusion public orders API and on-chain LOP queries.
 
-use alloy::primitives::U256;
+use std::str::FromStr;
+
+use alloy::primitives::{Address as AlloyAddress, U256};
+use alloy::sol;
+use alloy::sol_types::{SolCall, SolError as _};
 use anyhow::{bail, Context};
 use chrono::DateTime;
 use reqwest::Client;
 use serde::Deserialize;
 
+use crate::abi::RawOrderFields;
 use crate::order::{AuctionPoint, FusionOrder};
+use crate::parse_address;
+
+/// 1inch LOP v4 on Ethereum mainnet.
+pub(crate) const LOP_V4: AlloyAddress =
+    alloy::primitives::address!("111111125421cA6dc452d289314280a0f8842A65");
+
+/// `remainingInvalidatorForOrder(address,bytes32)` selector on LOP v4.
+/// Returns the remaining making amount for partially-fillable orders.
+/// Returns 0 if fully filled/cancelled, `U256::MAX` if never partially filled.
+const REMAINING_SELECTOR: [u8; 4] = [0x10, 0xad, 0x2c, 0x8b];
+
+// ABI for querying the Fusion Dutch-auction extension via LOP.simulate().
+// All Order address fields are `uint256` to match 1inch's packed `Address` type.
+// The extension's getTakingAmount reads transient storage set by the LOP before
+// calling it, so it cannot be called directly — we route through LOP.simulate()
+// which calls the extension with msg.sender == LOP.
+sol! {
+    struct FusionExtOrder {
+        uint256 salt;
+        uint256 maker;
+        uint256 receiver;
+        uint256 makerAsset;
+        uint256 takerAsset;
+        uint256 makingAmount;
+        uint256 takingAmount;
+        uint256 makerTraits;
+    }
+
+    interface IAmountGetter {
+        function getTakingAmount(
+            FusionExtOrder order,
+            bytes extension,
+            bytes32 orderHash,
+            address taker,
+            uint256 makingAmount,
+            uint256 remainingMakingAmount,
+            bytes extraData
+        ) external view returns (uint256);
+    }
+
+        // Renamed from IOrderMixin to avoid a name collision with the abi.rs interface.
+    interface ILopSimulate {
+        /// Calls `target.call(data)` and reverts with `SimulationResults(success, result)`.
+        function simulate(address target, bytes data) external;
+        error SimulationResults(bool success, bytes result);
+    }
+}
 
 /// Integer divisor for `initialRateBump` and auction point `coefficient` fields.
 /// 1inch encodes rate bumps as integer tenths-of-a-millionth: `50_000` = 0.5%.
@@ -94,19 +146,27 @@ struct ApiAuctionPoint {
     coefficient: u128,
 }
 
-/// Thin wrapper around `reqwest` for the 1inch Fusion active-orders endpoint.
+/// Thin wrapper around `reqwest` for the 1inch Fusion API and on-chain LOP queries.
 pub struct OneinchClient {
     http: Client,
     chain_id: u64,
+    /// Shared HTTP client for all Ethereum JSON-RPC calls.
+    rpc_client: Client,
+    /// Ethereum JSON-RPC URL for on-chain queries (remaining amount, taking amount).
+    rpc_url: String,
 }
 
 impl OneinchClient {
-    pub fn new(chain_id: u64) -> anyhow::Result<Self> {
+    pub fn new(chain_id: u64, rpc_url: String) -> anyhow::Result<Self> {
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .context("building HTTP client")?;
-        Ok(Self { http, chain_id })
+            .context("building 1inch HTTP client")?;
+        let rpc_client = Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .context("building Ethereum RPC HTTP client")?;
+        Ok(Self { http, chain_id, rpc_client, rpc_url })
     }
 
     /// Fetches all currently active Fusion orders for the configured chain.
@@ -142,6 +202,211 @@ impl OneinchClient {
         Ok(orders)
     }
 
+    /// Calls `LOP.remainingInvalidatorForOrder(maker, orderHash)` via a raw JSON-RPC
+    /// `eth_call` and returns the remaining making amount that can still be filled.
+    ///
+    /// - Returns `full_making` when the order is fresh (LOP returns `U256::MAX`) or on error.
+    /// - Returns `0` when the order is fully filled or cancelled.
+    /// - Returns the actual remaining making amount otherwise (clamped to `full_making`).
+    pub(crate) async fn query_remaining_making_amount(&self, order: &FusionOrder) -> U256 {
+        let full = order.making_amount;
+
+        let maker: AlloyAddress = match order.maker_address.parse() {
+            Ok(a) => a,
+            Err(_) => return full,
+        };
+
+        let hash_str = order.order_id.strip_prefix("0x").unwrap_or(&order.order_id);
+        let hash_bytes = match hex::decode(hash_str) {
+            Ok(b) if b.len() == 32 => b,
+            _ => return full,
+        };
+
+        // ABI-encode: remainingInvalidatorForOrder(address maker, bytes32 orderHash)
+        // = selector(4B) + address_padded(32B) + bytes32(32B)
+        let mut calldata = Vec::with_capacity(68);
+        calldata.extend_from_slice(&REMAINING_SELECTOR);
+        calldata.extend_from_slice(&[0u8; 12]); // address left-padded to 32 bytes
+        calldata.extend_from_slice(maker.as_slice());
+        calldata.extend_from_slice(&hash_bytes);
+
+        let lop_hex = format!("0x{}", hex::encode(LOP_V4.as_slice()));
+        let data_hex = format!("0x{}", hex::encode(&calldata));
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{"to": lop_hex, "data": data_hex}, "latest"],
+            "id": 1
+        });
+
+        let Ok(resp) = self.rpc_client.post(&self.rpc_url).json(&body).send().await else {
+            return full;
+        };
+
+        let json: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return full,
+        };
+
+        let hex_result = match json["result"].as_str() {
+            Some(s) => s.strip_prefix("0x").unwrap_or(s),
+            None => return full,
+        };
+
+        if hex_result.len() < 64 {
+            return full;
+        }
+
+        let Ok(raw) = hex::decode(&hex_result[hex_result.len() - 64..]) else { return full };
+
+        let val = U256::from_be_slice(&raw);
+        if val == U256::MAX {
+            full // fresh order: never partially filled
+        } else {
+            val.min(full)
+        }
+    }
+
+    /// Static-calls `extension.getTakingAmount(...)` to get the exact on-chain auction price.
+    ///
+    /// Returns `None` on RPC error, malformed order data, or call revert (e.g. order expired).
+    /// Callers fall back to the off-chain estimate when `None` is returned.
+    pub(crate) async fn query_onchain_taking_amount(
+        &self,
+        fusion_order: &FusionOrder,
+        fill_making_amount: U256,
+        remaining_making_amount: U256,
+        resolver: AlloyAddress,
+        pending_block_ts: u64,
+    ) -> Option<U256> {
+        // Extension contract address lives at hex chars [64:104] (bytes [32:52]).
+        let ext_hex = fusion_order.extension.strip_prefix("0x").unwrap_or(&fusion_order.extension);
+        if ext_hex.len() < 104 {
+            return None;
+        }
+        let ext_addr_bytes = hex::decode(&ext_hex[64..104]).ok()?;
+        let ext_addr = AlloyAddress::from_slice(&ext_addr_bytes);
+
+        let hash_str = fusion_order.order_id.strip_prefix("0x").unwrap_or(&fusion_order.order_id);
+        let hash_bytes: [u8; 32] = hex::decode(hash_str).ok()?.try_into().ok()?;
+
+        let extension_bytes = hex::decode(ext_hex).ok()?;
+
+        // Extract the TakingAmountData section from the extension header.
+        // Header is 32 bytes big-endian uint256; each section's end offset is packed in 32-bit chunks:
+        //   bits [95:64]  = MakingAmountData end offset  (header bytes [20:24])
+        //   bits [127:96] = TakingAmountData end offset  (header bytes [16:20])
+        // Section begin = previous section's end.
+        // The first 20 bytes of TakingAmountData are the getter address; the rest is extraData.
+        let taking_extra_data: alloy::primitives::Bytes = (|| -> Option<_> {
+            let hdr = extension_bytes.get(0..32)?;
+            let making_end = u32::from_be_bytes(hdr[20..24].try_into().ok()?) as usize;
+            let taking_end = u32::from_be_bytes(hdr[16..20].try_into().ok()?) as usize;
+            let begin = 32 + making_end;
+            let end   = 32 + taking_end;
+            let section = extension_bytes.get(begin..end)?;
+            // section[0:20] = getter address, section[20:] = extraData for getTakingAmount
+            Some(alloy::primitives::Bytes::copy_from_slice(section.get(20..)?))
+        })()
+        .unwrap_or_default();
+
+        let inner = IAmountGetter::getTakingAmountCall {
+            order: FusionExtOrder {
+                salt: U256::from_str(&fusion_order.salt).unwrap_or_default(),
+                maker: address_to_u256(&fusion_order.maker_address).ok()?,
+                receiver: address_to_u256(&fusion_order.receiver_address).ok()?,
+                makerAsset: address_to_u256(&fusion_order.from_token).ok()?,
+                takerAsset: address_to_u256(&fusion_order.to_token).ok()?,
+                makingAmount: fusion_order.making_amount,
+                takingAmount: fusion_order.auction_end_amount,
+                makerTraits: U256::from_str(&fusion_order.maker_traits).unwrap_or_default(),
+            },
+            extension: alloy::primitives::Bytes::from(extension_bytes),
+            orderHash: alloy::primitives::FixedBytes::from(hash_bytes),
+            taker: resolver,
+            makingAmount: fill_making_amount,
+            remainingMakingAmount: remaining_making_amount,
+            extraData: taking_extra_data,
+        };
+
+        // Wrap in LOP.simulate(extension_addr, inner_calldata).
+        // The LOP calls the extension with msg.sender == LOP and reverts with
+        // SimulationResults(success, abi.encode(taking_amount)).
+        let simulate_call = ILopSimulate::simulateCall {
+            target: ext_addr,
+            data: alloy::primitives::Bytes::from(inner.abi_encode()),
+        };
+        let lop_hex  = format!("0x{}", hex::encode(LOP_V4.as_slice()));
+        let data_hex = format!("0x{}", hex::encode(simulate_call.abi_encode()));
+
+        // Pass the pending block timestamp so the extension sees the same elapsed time our
+        // off-chain estimate used.  Without this, eth_call runs at the confirmed block
+        // timestamp (≈12 s earlier), which can make the auction appear not yet started and
+        // return the full start price — inflating the required taking amount.
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [
+                {"to": lop_hex, "data": data_hex},
+                "latest",
+                {},
+                {"time": format!("0x{:x}", pending_block_ts)}
+            ],
+            "id": 1
+        });
+
+        let resp = self.rpc_client.post(&self.rpc_url).json(&body).send().await.ok()?;
+        let json: serde_json::Value = resp.json().await.ok()?;
+
+        // simulate() ALWAYS reverts — expected revert is SimulationResults(success, result).
+        let err = json.get("error")?;
+        let revert_data_str = err.get("data").and_then(|d| d.as_str()).unwrap_or("");
+        let revert_hex = revert_data_str.strip_prefix("0x").unwrap_or(revert_data_str);
+        let revert_bytes = hex::decode(revert_hex).ok()?;
+
+        let sim = ILopSimulate::SimulationResults::abi_decode(&revert_bytes).ok()?;
+        if !sim.success {
+            tracing::debug!(
+                order_id = %fusion_order.order_id,
+                "getTakingAmount inner call reverted via simulate()",
+            );
+            return None;
+        }
+
+        if sim.result.len() < 32 {
+            return None;
+        }
+        Some(U256::from_be_slice(&sim.result[..32]))
+    }
+}
+
+/// Encodes a [`FusionOrder`]'s fields into [`RawOrderFields`] for ABI encoding.
+pub(crate) fn build_order_fields(fusion: &FusionOrder) -> anyhow::Result<RawOrderFields> {
+    Ok(RawOrderFields {
+        salt: U256::from_str(&fusion.salt)
+            .map_err(|e| anyhow::anyhow!("invalid order salt {:?}: {e}", fusion.salt))?,
+        maker: address_to_u256(&fusion.maker_address)?,
+        receiver: address_to_u256(&fusion.receiver_address)?,
+        maker_asset: address_to_u256(&fusion.from_token)?,
+        taker_asset: address_to_u256(&fusion.to_token)?,
+        making_amount: fusion.making_amount,
+        taking_amount: fusion.auction_end_amount,
+        maker_traits: U256::from_str(&fusion.maker_traits)
+            .map_err(|e| anyhow::anyhow!("invalid maker_traits {:?}: {e}", fusion.maker_traits))?,
+    })
+}
+
+pub(crate) fn address_to_u256(hex: &str) -> anyhow::Result<U256> {
+    let addr = parse_address(hex)?;
+    Ok(U256::from_be_slice(addr.as_ref()))
+}
+
+pub(crate) fn hex_to_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
+    let stripped = s.strip_prefix("0x").unwrap_or(s);
+    if stripped.is_empty() {
+        return Ok(vec![]);
+    }
+    hex::decode(stripped).map_err(|e| anyhow::anyhow!("hex decode: {e}"))
 }
 
 fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {

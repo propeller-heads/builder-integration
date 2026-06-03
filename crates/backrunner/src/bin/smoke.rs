@@ -133,6 +133,8 @@ async fn main() -> Result<()> {
         chain_id,
         resolver_address: resolver_addr,
         slippage: 0.005,
+        orderbook_interval: Duration::from_secs(12),
+        verify_onchain_taking: false,
     };
 
     tracing::info!("building backrunner (up to {READY_TIMEOUT_MINS} min)...");

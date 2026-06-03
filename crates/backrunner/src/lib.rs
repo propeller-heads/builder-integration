@@ -28,11 +28,11 @@ mod encode_test;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use alloy::primitives::{Address as AlloyAddress, U256};
+use alloy::primitives::{Address as AlloyAddress, I256, U256};
 
-use abi::{build_settle_calldata, RawOrderFields, SettleParams};
+use abi::{build_settle_calldata, SettleParams};
 use builder_types::{BackrunCandidate, BackrunTx, BlockEnv, BuildEvent, ExecutedTx, PostState, RawTx};
-use client::OneinchClient;
+use client::{build_order_fields, hex_to_bytes, OneinchClient};
 use fynd_core::{
     feed::market_data::MarketData, EncodingOptions, FyndBuilder, MarketEvent, Order, OrderQuote,
     OrderSide, PendingBlockProcessor, PendingError, QuoteOptions, QuoteRequest, Solver, SolveError,
@@ -50,42 +50,6 @@ use tycho_simulation::tycho_common::{
 };
 use uuid::Uuid;
 
-// ABI for querying the Fusion Dutch-auction extension via LOP.simulate().
-// All Order address fields are `uint256` to match 1inch's packed `Address` type.
-// The extension's getTakingAmount reads transient storage set by the LOP before
-// calling it, so it cannot be called directly — we route through LOP.simulate()
-// which calls the extension with msg.sender == LOP.
-alloy::sol! {
-    struct FusionExtOrder {
-        uint256 salt;
-        uint256 maker;
-        uint256 receiver;
-        uint256 makerAsset;
-        uint256 takerAsset;
-        uint256 makingAmount;
-        uint256 takingAmount;
-        uint256 makerTraits;
-    }
-
-    interface IAmountGetter {
-        function getTakingAmount(
-            FusionExtOrder order,
-            bytes extension,
-            bytes32 orderHash,
-            address taker,
-            uint256 makingAmount,
-            uint256 remainingMakingAmount,
-            bytes extraData
-        ) external view returns (uint256);
-    }
-
-    interface IOrderMixin {
-        /// Calls `target.call(data)` and reverts with `SimulationResults(success, result)`.
-        function simulate(address target, bytes data) external;
-        error SimulationResults(bool success, bytes result);
-    }
-}
-
 /// Configuration for a [`Backrunner`] instance.
 #[derive(Debug, Clone)]
 pub struct BackrunnerConfig {
@@ -93,7 +57,7 @@ pub struct BackrunnerConfig {
     pub chain: String,
     /// Tycho WebSocket host (e.g. `"app.propellerheads.xyz"`).
     pub tycho_url: String,
-    /// Ethereum JSON-RPC URL used for gas price fetching.
+    /// Ethereum JSON-RPC URL used for gas price fetching and on-chain order queries.
     pub rpc_url: String,
     /// Tycho API key, if required.
     pub tycho_api_key: Option<String>,
@@ -109,6 +73,17 @@ pub struct BackrunnerConfig {
     pub resolver_address: AlloyAddress,
     /// Slippage tolerance for Fynd quotes (0.005 = 0.5%).
     pub slippage: f64,
+    /// How often to refresh the 1inch Fusion orderbook.
+    ///
+    /// Shorter intervals are more reactive to new orders but increase API load.
+    /// Default: 12 seconds (one Ethereum block).
+    pub orderbook_interval: Duration,
+    /// When `true`, issues a static `eth_call` to verify the exact on-chain taking amount
+    /// before submitting a fill. Adds one RPC round-trip per profitable order candidate.
+    ///
+    /// Useful for debugging taking-amount discrepancies. Off by default for production
+    /// throughput.
+    pub verify_onchain_taking: bool,
 }
 
 /// Error returned by [`Backrunner::build`].
@@ -120,8 +95,8 @@ pub enum BuildError {
     Solver(#[from] SolverBuildError),
     #[error("timed out waiting for market data to be ready")]
     MarketDataTimeout,
-    #[error("failed to build 1inch client: {0}")]
-    OneinchClient(String),
+    #[error("failed to initialize HTTP clients: {0}")]
+    OneinchClient(#[from] anyhow::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -138,38 +113,15 @@ struct PendingIteration {
 }
 
 /// Consumes [`BuildEvent`]s from a block builder and publishes [`BackrunCandidate`]s.
-/// 1inch LOP v4 on Ethereum mainnet.
-const LOP_V4: AlloyAddress =
-    alloy::primitives::address!("111111125421cA6dc452d289314280a0f8842A65");
-
-/// `remainingInvalidatorForOrder(address,bytes32)` selector on LOP v4.
-/// Returns the remaining making amount for partially-fillable orders.
-/// Returns 0 if fully filled/cancelled, `U256::MAX` if never partially filled.
-const REMAINING_SELECTOR: [u8; 4] = [0x10, 0xad, 0x2c, 0x8b];
-
-/// Converts a [`BigUint`] to [`U256`], clamping to [`U256::MAX`] for values that don't fit.
-pub(crate) fn biguint_to_u256(b: &BigUint) -> U256 {
-    let bytes = b.to_bytes_be();
-    if bytes.is_empty() {
-        U256::ZERO
-    } else if bytes.len() > 32 {
-        U256::MAX
-    } else {
-        U256::from_be_slice(&bytes)
-    }
-}
-
 pub struct Backrunner {
     solver: Solver,
     pending: tokio::sync::Mutex<PendingBlockProcessor>,
-    /// Receiver for the current set of live Fusion orders (refreshed ~every 12s).
+    /// Receiver for the current set of live Fusion orders (refreshed per `orderbook_interval`).
     orders_rx: watch::Receiver<Arc<Vec<FusionOrder>>>,
     pub(crate) resolver_address: AlloyAddress,
     pub(crate) slippage: f64,
-    /// RPC URL for direct on-chain queries (remaining amount, etc.).
-    rpc_url: String,
-    /// Shared HTTP client for all RPC calls — reuses connection pool across requests.
-    rpc_client: reqwest::Client,
+    oneinch: Arc<OneinchClient>,
+    verify_onchain_taking: bool,
 }
 
 impl Backrunner {
@@ -177,13 +129,12 @@ impl Backrunner {
     pub async fn build(config: BackrunnerConfig) -> Result<Self, BuildError> {
         let chain = parse_chain(&config.chain)?;
 
-        let oneinch = OneinchClient::new(config.chain_id)
-            .map_err(|e| BuildError::OneinchClient(e.to_string()))?;
+        let oneinch = Arc::new(OneinchClient::new(config.chain_id, config.rpc_url.clone())?);
 
         let builder = FyndBuilder::new(
             chain,
             config.tycho_url,
-            config.rpc_url.clone(),
+            config.rpc_url,
             config.protocols,
             config.min_tvl,
         )
@@ -206,16 +157,15 @@ impl Backrunner {
             .map_err(|_| BuildError::MarketDataTimeout)?;
 
         // Seed the watch channel with an empty orderbook; the background task
-        // will populate it on the first poll (within 12 seconds).
+        // will populate it on the first poll.
         let (orders_tx, orders_rx) = watch::channel(Arc::new(Vec::new()));
-
         let market_data_for_orders = solver.market_data();
-        tokio::spawn(run_orderbook(Arc::new(oneinch), orders_tx, market_data_for_orders));
-
-        let rpc_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| BuildError::OneinchClient(format!("building RPC client: {e}")))?;
+        tokio::spawn(run_orderbook(
+            Arc::clone(&oneinch),
+            orders_tx,
+            market_data_for_orders,
+            config.orderbook_interval,
+        ));
 
         Ok(Self {
             solver,
@@ -223,14 +173,14 @@ impl Backrunner {
             orders_rx,
             resolver_address: config.resolver_address,
             slippage: config.slippage,
-            rpc_url: config.rpc_url.clone(),
-            rpc_client,
+            oneinch,
+            verify_onchain_taking: config.verify_onchain_taking,
         })
     }
 
     /// Returns the number of live Fusion orders currently held by the orderbook poller.
     ///
-    /// Zero until the first poll completes (~12 s after `build()`).
+    /// Zero until the first poll completes.
     pub fn active_order_count(&self) -> usize {
         self.orders_rx.borrow().len()
     }
@@ -266,14 +216,226 @@ impl Backrunner {
         let mut pending: HashMap<Uuid, PendingIteration> = HashMap::new();
 
         while let Some(event) = events.recv().await {
-            handle_event(&self, &mut pending, &candidates, event).await;
+            self.handle_event(&mut pending, &candidates, event).await;
         }
 
         tracing::info!("event channel closed, backrunner shutting down");
     }
+
+    async fn handle_event(
+        &self,
+        pending: &mut HashMap<Uuid, PendingIteration>,
+        candidates: &watch::Sender<Option<BackrunCandidate>>,
+        event: BuildEvent,
+    ) {
+        match event {
+            BuildEvent::IterationStart { uuid, block } => {
+                debug!(%uuid, block_number = block.block_number, "iteration started");
+                pending.insert(uuid, PendingIteration { block, txs: vec![] });
+            }
+            BuildEvent::TxExecuted { uuid, tx } => {
+                if let Some(iter) = pending.get_mut(&uuid) {
+                    iter.txs.push(tx);
+                } else {
+                    warn!(%uuid, "TxExecuted for unknown iteration");
+                }
+            }
+            BuildEvent::IterationComplete { uuid, state } => {
+                let Some(iter) = pending.remove(&uuid) else {
+                    warn!(%uuid, "IterationComplete for unknown iteration");
+                    return;
+                };
+                let candidate = self.evaluate_backrun(uuid, iter, state).await;
+                if let Err(e) = candidates.send(candidate) {
+                    error!(error = %e, "candidate watch channel has no receivers");
+                }
+            }
+            BuildEvent::IterationAborted { uuid } => {
+                debug!(%uuid, "iteration aborted");
+                pending.remove(&uuid);
+            }
+        }
+    }
+
+    async fn evaluate_backrun(
+        &self,
+        uuid: Uuid,
+        iter: PendingIteration,
+        _state: PostState,
+    ) -> Option<BackrunCandidate> {
+        debug!(
+            %uuid,
+            block_number = iter.block.block_number,
+            tx_count = iter.txs.len(),
+            "evaluating backrun opportunity",
+        );
+
+        let orders = self.orders_rx.borrow().clone();
+        let block_ts = iter.block.block_timestamp;
+
+        let active: Vec<&FusionOrder> =
+            orders.iter().filter(|o| amount_at_timestamp(o, block_ts).is_some()).collect();
+
+        if active.is_empty() {
+            debug!(%uuid, "no active Fusion orders at block timestamp");
+            return None;
+        }
+
+        // Query on-chain remaining making amount for each active order (concurrent).
+        let remaining_amounts: Vec<U256> =
+            futures::future::join_all(active.iter().map(|&order| {
+                let oneinch = Arc::clone(&self.oneinch);
+                async move { oneinch.query_remaining_making_amount(order).await }
+            }))
+            .await;
+
+        // Build a map from order_id → adjusted FusionOrder (making_amount = min(remaining, original)).
+        // Orders where remaining = 0 (fully filled/cancelled) are dropped.
+        let adjusted: HashMap<String, FusionOrder> = active
+            .iter()
+            .zip(remaining_amounts.iter())
+            .filter_map(|(&order, &remaining)| {
+                if remaining.is_zero() {
+                    debug!(order_id = %order.order_id, "order fully filled on-chain, skipping");
+                    return None;
+                }
+                let fill_making = remaining.min(order.making_amount);
+                if fill_making < order.making_amount {
+                    debug!(
+                        order_id = %order.order_id,
+                        making_amount = %order.making_amount,
+                        remaining = %remaining,
+                        "partial fill detected — quoting Fynd for remaining amount",
+                    );
+                }
+                Some((order.order_id.clone(), FusionOrder { making_amount: fill_making, ..order.clone() }))
+            })
+            .collect();
+
+        if adjusted.is_empty() {
+            debug!(%uuid, "all active orders are fully filled on-chain");
+            return None;
+        }
+
+        let adjusted_refs: Vec<&FusionOrder> = adjusted.values().collect();
+
+        let (quote, pending_label) =
+            match self.try_evaluate(uuid, &iter, &adjusted_refs).await {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    debug!(%uuid, "parent block not yet confirmed, skipping");
+                    return None;
+                }
+                Err(e) => {
+                    warn!(%uuid, error = %e, "evaluate_backrun failed");
+                    return None;
+                }
+            };
+
+        // Map from order_id → ORIGINAL FusionOrder (needed for pro-rating the taking amount).
+        let order_map: HashMap<&str, &FusionOrder> =
+            active.iter().map(|o| (o.order_id.as_str(), *o)).collect();
+
+        let ctx = BackrunContext {
+            uuid,
+            block_ts,
+            base_fee: iter.block.base_fee_per_gas,
+            block_number: iter.block.block_number,
+            solve_time_ms: quote.solve_time_ms(),
+            orders_quoted: adjusted.len(),
+            backrunner: self,
+            state_label: pending_label.clone(),
+        };
+
+        let mut backrun_txs: Vec<BackrunTx> = Vec::new();
+
+        for order_quote in quote.orders() {
+            let Some(&fusion_order) = order_map.get(order_quote.order_id()) else { continue };
+            let fill_amount = adjusted
+                .get(order_quote.order_id())
+                .map(|o| o.making_amount)
+                .unwrap_or(fusion_order.making_amount);
+
+            if let Some(backrun_tx) =
+                build_backrun_tx(&ctx, fusion_order, order_quote, fill_amount).await
+            {
+                backrun_txs.push(backrun_tx);
+            }
+        }
+
+        // Always clean up the pending state label regardless of outcome.
+        self.solver.market_data().remove_labeled_state(&pending_label).await;
+
+        if backrun_txs.is_empty() {
+            return None;
+        }
+
+        Some(BackrunCandidate {
+            uuid,
+            block_number: iter.block.block_number,
+            txs: backrun_txs,
+        })
+    }
+
+    async fn try_evaluate(
+        &self,
+        uuid: Uuid,
+        iter: &PendingIteration,
+        active_orders: &[&FusionOrder],
+    ) -> Result<Option<(fynd_core::Quote, String)>, EvaluateError> {
+        let tx_inputs: Vec<TxInput> = iter
+            .txs
+            .iter()
+            .enumerate()
+            .map(|(i, tx)| to_tx_input(tx, i as u64))
+            .collect();
+
+        let target_header = build_block_header(&iter.block);
+        let label = format!("backrun-{uuid}");
+
+        let pending_update = {
+            let mut guard = self.pending.lock().await;
+            match guard.generate_pending_update(&tx_inputs, target_header, label.clone()).await {
+                Ok(update) => update,
+                Err(PendingError::ParentNotYetConfirmed { needed, current }) => {
+                    debug!(needed, current, "parent block not yet confirmed");
+                    return Ok(None);
+                }
+                Err(e) => return Err(EvaluateError::Pending(e)),
+            }
+        };
+
+        let states = pending_update.update.states;
+        let valid_until = iter.block.block_number;
+
+        self.solver
+            .market_data()
+            .register_labeled_state(label.clone(), states, valid_until)
+            .await;
+
+        let fynd_orders: Vec<Order> = active_orders
+            .iter()
+            .filter_map(|o| fusion_order_to_fynd(o, self.resolver_address))
+            .collect();
+
+        let options = QuoteOptions::default()
+            .with_state_label(label.clone())
+            .with_encoding_options(EncodingOptions::new(self.slippage));
+        let request = QuoteRequest::new(fynd_orders, options);
+        let quote_result = self.solver.quote(request).await;
+
+        // On quote error, clean up the label and propagate — caller won't hold the label.
+        match quote_result {
+            Ok(quote) => Ok(Some((quote, label))),
+            Err(e) => {
+                self.solver.market_data().remove_labeled_state(&label).await;
+                Err(EvaluateError::Solve(e))
+            }
+        }
+    }
 }
 
-/// Background task: polls 1inch Fusion for active orders every 12 seconds.
+/// Background task: polls 1inch Fusion for active orders at the configured interval.
 ///
 /// After each fetch, token decimals are patched from Tycho's registry (which has exact
 /// on-chain values for every indexed token) to fix any fallback-18 from the 1inch API.
@@ -281,12 +443,13 @@ async fn run_orderbook(
     client: Arc<OneinchClient>,
     orders_tx: watch::Sender<Arc<Vec<FusionOrder>>>,
     market_data: MarketData,
+    interval: Duration,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(12));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        interval.tick().await;
+        ticker.tick().await;
         match client.fetch_active_orders().await {
             Ok(orders) => {
                 let mut filtered: Vec<FusionOrder> =
@@ -344,168 +507,6 @@ fn parse_chain(s: &str) -> Result<tycho_simulation::tycho_common::models::Chain,
     }
 }
 
-async fn handle_event(
-    backrunner: &Backrunner,
-    pending: &mut HashMap<Uuid, PendingIteration>,
-    candidates: &watch::Sender<Option<BackrunCandidate>>,
-    event: BuildEvent,
-) {
-    match event {
-        BuildEvent::IterationStart { uuid, block } => {
-            debug!(%uuid, block_number = block.block_number, "iteration started");
-            pending.insert(uuid, PendingIteration { block, txs: vec![] });
-        }
-        BuildEvent::TxExecuted { uuid, tx } => {
-            if let Some(iter) = pending.get_mut(&uuid) {
-                iter.txs.push(tx);
-            } else {
-                warn!(%uuid, "TxExecuted for unknown iteration");
-            }
-        }
-        BuildEvent::IterationComplete { uuid, state } => {
-            let Some(iter) = pending.remove(&uuid) else {
-                warn!(%uuid, "IterationComplete for unknown iteration");
-                return;
-            };
-            let candidate = evaluate_backrun(backrunner, uuid, iter, state).await;
-            if let Err(e) = candidates.send(candidate) {
-                error!(error = %e, "candidate watch channel has no receivers");
-            }
-        }
-        BuildEvent::IterationAborted { uuid } => {
-            debug!(%uuid, "iteration aborted");
-            pending.remove(&uuid);
-        }
-    }
-}
-
-async fn evaluate_backrun(
-    backrunner: &Backrunner,
-    uuid: Uuid,
-    iter: PendingIteration,
-    _state: PostState,
-) -> Option<BackrunCandidate> {
-    debug!(
-        %uuid,
-        block_number = iter.block.block_number,
-        tx_count = iter.txs.len(),
-        "evaluating backrun opportunity",
-    );
-
-    let orders = backrunner.orders_rx.borrow().clone();
-    let block_ts = iter.block.block_timestamp;
-
-    let active: Vec<&FusionOrder> =
-        orders.iter().filter(|o| amount_at_timestamp(o, block_ts).is_some()).collect();
-
-    if active.is_empty() {
-        debug!(%uuid, "no active Fusion orders at block timestamp");
-        return None;
-    }
-
-    // Query on-chain remaining making amount for each active order (concurrent).
-    // This detects partially-filled orders so we quote Fynd for the correct amount.
-    let rpc_client = backrunner.rpc_client.clone();
-    let rpc_url = backrunner.rpc_url.clone();
-    let remaining_amounts: Vec<U256> =
-        futures::future::join_all(active.iter().map(|o| {
-            let client = rpc_client.clone();
-            let url = rpc_url.clone();
-            async move { query_remaining_making_amount(&client, &url, o).await }
-        }))
-        .await;
-
-    // Build an adjusted FusionOrder per active order using the on-chain remaining amount.
-    // Orders where remaining = 0 (fully filled/cancelled) are dropped.
-    let adjusted: Vec<FusionOrder> = active
-        .iter()
-        .zip(remaining_amounts.iter())
-        .filter_map(|(&order, &remaining)| {
-            if remaining.is_zero() {
-                debug!(order_id = %order.order_id, "order fully filled on-chain, skipping");
-                return None;
-            }
-            if remaining < order.making_amount {
-                debug!(
-                    order_id = %order.order_id,
-                    making_amount = %order.making_amount,
-                    remaining = %remaining,
-                    "partial fill detected — quoting Fynd for remaining amount",
-                );
-            }
-            // Use min(remaining, making_amount) as the fill amount for Fynd.
-            Some(FusionOrder { making_amount: remaining.min(order.making_amount), ..order.clone() })
-        })
-        .collect();
-
-    if adjusted.is_empty() {
-        debug!(%uuid, "all active orders are fully filled on-chain");
-        return None;
-    }
-
-    let adjusted_refs: Vec<&FusionOrder> = adjusted.iter().collect();
-
-    // Build a map from order_id → remaining amount for use during settlement.
-    let remaining_map: HashMap<&str, U256> = active
-        .iter()
-        .zip(remaining_amounts.iter())
-        .map(|(&o, &r)| (o.order_id.as_str(), r.min(o.making_amount)))
-        .collect();
-
-    let quote = match try_evaluate(backrunner, uuid, &iter, &adjusted_refs).await {
-        Ok(Some(q)) => q,
-        Ok(None) => {
-            debug!(%uuid, "parent block not yet confirmed, skipping");
-            return None;
-        }
-        Err(e) => {
-            warn!(%uuid, error = %e, "evaluate_backrun failed");
-            return None;
-        }
-    };
-
-    // Build a map from order_id → ORIGINAL FusionOrder for taking_amount computation.
-    let order_map: HashMap<&str, &FusionOrder> =
-        active.iter().map(|o| (o.order_id.as_str(), *o)).collect();
-
-    let ctx = BackrunContext {
-        uuid,
-        block_ts,
-        base_fee: iter.block.base_fee_per_gas,
-        block_number: iter.block.block_number,
-        solve_time_ms: quote.solve_time_ms(),
-        orders_quoted: adjusted.len(),
-        backrunner,
-    };
-
-    let mut backrun_txs: Vec<BackrunTx> = Vec::new();
-
-    for order_quote in quote.orders() {
-        let Some(fynd_tx) = order_quote.transaction() else { continue };
-        let Some(&fusion_order) = order_map.get(order_quote.order_id()) else { continue };
-        let fill_amount: U256 = remaining_map
-            .get(order_quote.order_id())
-            .copied()
-            .unwrap_or(fusion_order.making_amount);
-
-        if let Some(backrun_tx) =
-            build_backrun_tx(&ctx, fusion_order, order_quote, fynd_tx, fill_amount).await
-        {
-            backrun_txs.push(backrun_tx);
-        }
-    }
-
-    if backrun_txs.is_empty() {
-        return None;
-    }
-
-    Some(BackrunCandidate {
-        uuid,
-        block_number: iter.block.block_number,
-        txs: backrun_txs,
-    })
-}
-
 /// Iteration-level context shared across all per-order calls inside [`evaluate_backrun`].
 struct BackrunContext<'a> {
     uuid: Uuid,
@@ -515,6 +516,8 @@ struct BackrunContext<'a> {
     solve_time_ms: u64,
     orders_quoted: usize,
     backrunner: &'a Backrunner,
+    /// The pending-state label registered in `try_evaluate`, used for the surplus swap quote.
+    state_label: String,
 }
 
 /// Gates on profitability, then delegates settlement construction to [`assemble_backrun_tx`].
@@ -522,10 +525,10 @@ async fn build_backrun_tx(
     ctx: &BackrunContext<'_>,
     fusion_order: &FusionOrder,
     order_quote: &OrderQuote,
-    fynd_tx: &fynd_core::Transaction,
     fill_amount: U256,
 ) -> Option<BackrunTx> {
     let BackrunContext { uuid, block_ts, base_fee, backrunner, .. } = ctx;
+    let fynd_tx = order_quote.transaction()?;
 
     // Exact on-chain taking amount estimate:
     //   rateBump = max(0, auctionBump − gasBump)      ← gas subtracts from rate
@@ -568,25 +571,26 @@ async fn build_backrun_tx(
         taking_estimate = %taking_amount,
         margin_bps = (amount_out.saturating_sub(taking_amount) * U256::from(10_000u64)
             / taking_amount.max(U256::ONE)).saturating_to::<u64>(),
-        "order passed profitability filter — querying on-chain taking amount");
+        "order passed profitability filter");
 
-    // Pre-flight: static-call extension.getTakingAmount to get the exact on-chain price.
-    // Our Rust estimate can diverge from the contract due to arithmetic differences or
-    // resolver fees added inside getTakingAmount. Checking here avoids failed fill simulations.
+    // Optional pre-flight: static-call extension.getTakingAmount to verify the exact
+    // on-chain price. Enabled only when `verify_onchain_taking` is set — adds one RPC
+    // round-trip per order and is off by default for production throughput.
     //
     // We pass the pending block timestamp so the extension sees the same elapsed time as our
     // off-chain estimate — without it the eth_call runs at the confirmed block timestamp
     // (12 s earlier), which can land before the auction start and return the full start price.
-    let onchain_taking = query_onchain_taking_amount(
-        &backrunner.rpc_client,
-        &backrunner.rpc_url,
-        fusion_order,
-        fill_amount,
-        fill_amount,
-        backrunner.resolver_address,
-        *block_ts,
-    )
-    .await;
+    let onchain_taking = if backrunner.verify_onchain_taking {
+        backrunner.oneinch.query_onchain_taking_amount(
+            fusion_order,
+            fill_amount,
+            fill_amount,
+            backrunner.resolver_address,
+            *block_ts,
+        ).await
+    } else {
+        None
+    };
 
     match onchain_taking {
         Some(onchain) if amount_out < onchain => {
@@ -608,8 +612,7 @@ async fn build_backrun_tx(
                 taking_estimate = %taking_amount,
                 "on-chain taking amount verified, proceeding to fill");
         }
-        None => debug!(%uuid, order_id = %fusion_order.order_id,
-            "on-chain taking amount query failed, using estimate"),
+        None => {}
     }
 
     assemble_backrun_tx(ctx, fusion_order, fynd_tx, fill_amount, amount_out, taking_amount).await
@@ -627,7 +630,7 @@ async fn assemble_backrun_tx(
     amount_out: U256,
     taking_estimate: U256,
 ) -> Option<BackrunTx> {
-    let BackrunContext { uuid, base_fee, block_number, solve_time_ms, orders_quoted, backrunner, .. } =
+    let BackrunContext { uuid, base_fee, block_number, solve_time_ms, orders_quoted, backrunner, state_label, .. } =
         ctx;
 
     let surplus_amount = amount_out.saturating_sub(taking_estimate);
@@ -637,7 +640,7 @@ async fn assemble_backrun_tx(
             &fusion_order.to_token,
             surplus_amount,
             backrunner.resolver_address,
-            format!("surplus-{uuid}"),
+            state_label.clone(),
         )
         .await
     } else {
@@ -649,7 +652,7 @@ async fn assemble_backrun_tx(
         .and_then(|q| q.transaction())
         .map_or_else(Vec::new, |tx| tx.data().to_vec());
 
-    let raw_order = match build_raw_order_fields(fusion_order) {
+    let raw_order = match build_order_fields(fusion_order) {
         Ok(f) => f,
         Err(e) => {
             warn!(%uuid, order_id = %fusion_order.order_id, "bad order fields: {e}");
@@ -695,10 +698,7 @@ async fn assemble_backrun_tx(
         max_priority_fee_per_gas: 100_000_000,
     };
 
-    let expected_profit = alloy::primitives::I256::try_from(
-        i128::try_from(surplus_amount.saturating_to::<u128>()).unwrap_or(i128::MAX),
-    )
-    .unwrap_or_default();
+    let expected_profit = I256::try_from(surplus_amount).unwrap_or(I256::MAX);
 
     debug!(%uuid, block_number, solve_time_ms, orders_quoted,
         amount_out = %amount_out,
@@ -709,60 +709,7 @@ async fn assemble_backrun_tx(
     Some(BackrunTx { tx: raw_tx, expected_profit_wei: expected_profit, expected_gas: 300_000 })
 }
 
-async fn try_evaluate(
-    backrunner: &Backrunner,
-    uuid: Uuid,
-    iter: &PendingIteration,
-    active_orders: &[&FusionOrder],
-) -> Result<Option<fynd_core::Quote>, EvaluateError> {
-    let tx_inputs: Vec<TxInput> = iter
-        .txs
-        .iter()
-        .enumerate()
-        .map(|(i, tx)| to_tx_input(tx, i as u64))
-        .collect();
-
-    let target_header = build_block_header(&iter.block);
-    let label = format!("backrun-{uuid}");
-
-    let pending_update = {
-        let mut guard = backrunner.pending.lock().await;
-        match guard.generate_pending_update(&tx_inputs, target_header, label.clone()).await {
-            Ok(update) => update,
-            Err(PendingError::ParentNotYetConfirmed { needed, current }) => {
-                debug!(needed, current, "parent block not yet confirmed");
-                return Ok(None);
-            }
-            Err(e) => return Err(EvaluateError::Pending(e)),
-        }
-    };
-
-    let states = pending_update.update.states;
-    let valid_until = iter.block.block_number;
-
-    backrunner
-        .solver
-        .market_data()
-        .register_labeled_state(label.clone(), states, valid_until)
-        .await;
-
-    let fynd_orders: Vec<Order> = active_orders
-        .iter()
-        .filter_map(|o| fusion_order_to_fynd(o, backrunner.resolver_address))
-        .collect();
-
-    let options = QuoteOptions::default()
-        .with_state_label(label.clone())
-        .with_encoding_options(EncodingOptions::new(backrunner.slippage));
-    let request = QuoteRequest::new(fynd_orders, options);
-    let quote_result = backrunner.solver.quote(request).await;
-
-    backrunner.solver.market_data().remove_labeled_state(&label).await;
-
-    Ok(Some(quote_result.map_err(EvaluateError::Solve)?))
-}
-
-/// Quotes a surplus→WETH swap via Fynd. Returns the `OrderQuote` if a route exists.
+/// Quotes a surplus→WETH swap via Fynd using the same pending state label as the main quote.
 ///
 /// Returns `None` if `token_in` is WETH (direct unwrap; no swap needed) or no route found.
 /// Uses 100% slippage (minAmountOut = 0) so amountIn can be patched on-chain safely.
@@ -784,13 +731,7 @@ async fn quote_surplus_swap(
         let bytes = surplus_amount.to_be_bytes::<32>();
         BigUint::from_bytes_be(&bytes)
     };
-    let order = Order::new(
-        from_bytes,
-        to_bytes,
-        amount,
-        OrderSide::Sell,
-        sender,
-    );
+    let order = Order::new(from_bytes, to_bytes, amount, OrderSide::Sell, sender);
     // 100% slippage → minAmountOut = 0; resolver patches amountIn on-chain.
     let options = QuoteOptions::default()
         .with_state_label(state_label)
@@ -824,237 +765,6 @@ fn fusion_order_to_fynd(fusion: &FusionOrder, resolver_address: AlloyAddress) ->
         Order::new(from_bytes, to_bytes, amount, OrderSide::Sell, sender)
             .with_id(fusion.order_id.clone()),
     )
-}
-
-fn build_raw_order_fields(fusion: &FusionOrder) -> anyhow::Result<RawOrderFields> {
-    use std::str::FromStr;
-    Ok(RawOrderFields {
-        salt: U256::from_str(&fusion.salt)
-            .map_err(|e| anyhow::anyhow!("invalid order salt {:?}: {e}", fusion.salt))?,
-        maker: address_str_to_u256(&fusion.maker_address)?,
-        receiver: address_str_to_u256(&fusion.receiver_address)?,
-        maker_asset: address_str_to_u256(&fusion.from_token)?,
-        taker_asset: address_str_to_u256(&fusion.to_token)?,
-        making_amount: fusion.making_amount,
-        taking_amount: fusion.auction_end_amount,
-        maker_traits: U256::from_str(&fusion.maker_traits)
-            .map_err(|e| anyhow::anyhow!("invalid maker_traits {:?}: {e}", fusion.maker_traits))?,
-    })
-}
-
-fn address_str_to_u256(hex: &str) -> anyhow::Result<alloy::primitives::U256> {
-    let addr = parse_address(hex)?;
-    Ok(alloy::primitives::U256::from_be_slice(addr.as_ref()))
-}
-
-fn hex_to_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
-    let stripped = s.strip_prefix("0x").unwrap_or(s);
-    if stripped.is_empty() {
-        return Ok(vec![]);
-    }
-    hex::decode(stripped).map_err(|e| anyhow::anyhow!("hex decode: {e}"))
-}
-
-/// Decodes a `0x`-prefixed 20-byte address hex string into `TychoBytes`.
-pub(crate) fn parse_address(hex_str: &str) -> anyhow::Result<TychoBytes> {
-    let stripped = hex_str
-        .strip_prefix("0x")
-        .ok_or_else(|| anyhow::anyhow!("missing 0x prefix: {hex_str}"))?;
-    let raw = hex::decode(stripped)
-        .map_err(|e| anyhow::anyhow!("hex-decode failed for {hex_str}: {e}"))?;
-    anyhow::ensure!(raw.len() == 20, "expected 20 bytes, got {}: {hex_str}", raw.len());
-    Ok(TychoBytes::from(raw))
-}
-
-/// Calls `LOP.remainingInvalidatorForOrder(maker, orderHash)` via a raw JSON-RPC
-/// `eth_call` and returns the remaining making amount that can still be filled.
-///
-/// - Returns `full_making` when the order is fresh (LOP returns `U256::MAX`) or on error.
-/// - Returns `0` when the order is fully filled or cancelled.
-/// - Returns the actual remaining making amount otherwise (clamped to `full_making`).
-async fn query_remaining_making_amount(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    order: &FusionOrder,
-) -> U256 {
-    let full = order.making_amount;
-
-    // Parse maker address
-    let maker: AlloyAddress = match order.maker_address.parse() {
-        Ok(a) => a,
-        Err(_) => return full,
-    };
-
-    // Parse order hash (bytes32)
-    let hash_str = order.order_id.strip_prefix("0x").unwrap_or(&order.order_id);
-    let hash_bytes = match hex::decode(hash_str) {
-        Ok(b) if b.len() == 32 => b,
-        _ => return full,
-    };
-
-    // ABI-encode: remainingInvalidatorForOrder(address maker, bytes32 orderHash)
-    // = selector(4B) + address_padded(32B) + bytes32(32B)
-    let mut calldata = Vec::with_capacity(68);
-    calldata.extend_from_slice(&REMAINING_SELECTOR);
-    calldata.extend_from_slice(&[0u8; 12]); // address left-padded to 32 bytes
-    calldata.extend_from_slice(maker.as_slice());
-    calldata.extend_from_slice(&hash_bytes);
-
-    // Build raw JSON-RPC eth_call payload (no alloy provider needed)
-    let lop_hex = format!("0x{}", hex::encode(LOP_V4.as_slice()));
-    let data_hex = format!("0x{}", hex::encode(&calldata));
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "eth_call",
-        "params": [{"to": lop_hex, "data": data_hex}, "latest"],
-        "id": 1
-    });
-
-    let Ok(resp) = client.post(rpc_url).json(&body).send().await else { return full };
-
-    let json: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return full,
-    };
-
-    // Parse hex result → U256, clamped to full_making.
-    let hex_result = match json["result"].as_str() {
-        Some(s) => s.strip_prefix("0x").unwrap_or(s),
-        None => return full,
-    };
-
-    if hex_result.len() < 64 {
-        return full;
-    }
-
-    let Ok(raw) = hex::decode(&hex_result[hex_result.len() - 64..]) else { return full };
-
-    let val = U256::from_be_slice(&raw);
-    if val == U256::MAX {
-        full // fresh order: never partially filled
-    } else {
-        val.min(full)
-    }
-}
-
-/// Static-calls `extension.getTakingAmount(...)` to get the exact on-chain auction price.
-///
-/// Returns `None` on RPC error, malformed order data, or call revert (e.g. order expired).
-/// Callers fall back to the off-chain estimate when `None` is returned.
-async fn query_onchain_taking_amount(
-    client: &reqwest::Client,
-    rpc_url: &str,
-    fusion_order: &FusionOrder,
-    fill_making_amount: U256,
-    remaining_making_amount: U256,
-    resolver: AlloyAddress,
-    pending_block_ts: u64,
-) -> Option<U256> {
-    use alloy::sol_types::{SolCall, SolError as _};
-    use std::str::FromStr;
-
-    // Extension contract address lives at hex chars [64:104] (bytes [32:52]).
-    let ext_hex = fusion_order.extension.strip_prefix("0x").unwrap_or(&fusion_order.extension);
-    if ext_hex.len() < 104 {
-        return None;
-    }
-    let ext_addr_bytes = hex::decode(&ext_hex[64..104]).ok()?;
-    let ext_addr = AlloyAddress::from_slice(&ext_addr_bytes);
-
-    // Order hash as bytes32.
-    let hash_str = fusion_order.order_id.strip_prefix("0x").unwrap_or(&fusion_order.order_id);
-    let hash_bytes: [u8; 32] = hex::decode(hash_str).ok()?.try_into().ok()?;
-
-    let extension_bytes = hex::decode(ext_hex).ok()?;
-
-    // Extract the TakingAmountData section from the extension header.
-    // Header is 32 bytes big-endian uint256; each section's end offset is packed in 32-bit chunks:
-    //   bits [95:64]  = MakingAmountData end offset  (header bytes [20:24])
-    //   bits [127:96] = TakingAmountData end offset  (header bytes [16:20])
-    // Section begin = previous section's end.
-    // The first 20 bytes of TakingAmountData are the getter address; the rest is extraData.
-    let taking_extra_data: alloy::primitives::Bytes = (|| -> Option<_> {
-        let hdr = extension_bytes.get(0..32)?;
-        let making_end = u32::from_be_bytes(hdr[20..24].try_into().ok()?) as usize;
-        let taking_end = u32::from_be_bytes(hdr[16..20].try_into().ok()?) as usize;
-        let begin = 32 + making_end;
-        let end   = 32 + taking_end;
-        let section = extension_bytes.get(begin..end)?;
-        // section[0:20] = getter address, section[20:] = extraData for getTakingAmount
-        Some(alloy::primitives::Bytes::copy_from_slice(section.get(20..)?))
-    })()
-    .unwrap_or_default();
-
-    // Build the inner getTakingAmount calldata.
-    let inner = IAmountGetter::getTakingAmountCall {
-        order: FusionExtOrder {
-            salt: U256::from_str(&fusion_order.salt).unwrap_or_default(),
-            maker: address_str_to_u256(&fusion_order.maker_address).ok()?,
-            receiver: address_str_to_u256(&fusion_order.receiver_address).ok()?,
-            makerAsset: address_str_to_u256(&fusion_order.from_token).ok()?,
-            takerAsset: address_str_to_u256(&fusion_order.to_token).ok()?,
-            makingAmount: fusion_order.making_amount,
-            takingAmount: fusion_order.auction_end_amount,
-            makerTraits: U256::from_str(&fusion_order.maker_traits).unwrap_or_default(),
-        },
-        extension: alloy::primitives::Bytes::from(extension_bytes),
-        orderHash: alloy::primitives::FixedBytes::from(hash_bytes),
-        taker: resolver,
-        makingAmount: fill_making_amount,
-        remainingMakingAmount: remaining_making_amount,
-        extraData: taking_extra_data,
-    };
-
-    // Wrap in LOP.simulate(extension_addr, inner_calldata).
-    // The LOP calls the extension with msg.sender == LOP and reverts with
-    // SimulationResults(success, abi.encode(taking_amount)).
-    let simulate_call = IOrderMixin::simulateCall {
-        target: ext_addr,
-        data: alloy::primitives::Bytes::from(inner.abi_encode()),
-    };
-    let lop_hex   = format!("0x{}", hex::encode(LOP_V4.as_slice()));
-    let data_hex  = format!("0x{}", hex::encode(simulate_call.abi_encode()));
-
-    // Pass the pending block timestamp so the extension sees the same elapsed time our
-    // off-chain estimate used.  Without this, eth_call runs at the confirmed block
-    // timestamp (≈12 s earlier), which can make the auction appear not yet started and
-    // return the full start price — inflating the required taking amount.
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "eth_call",
-        "params": [
-            {"to": lop_hex, "data": data_hex},
-            "latest",
-            {},
-            {"time": format!("0x{:x}", pending_block_ts)}
-        ],
-        "id": 1
-    });
-
-    let resp = client.post(rpc_url).json(&body).send().await.ok()?;
-    let json: serde_json::Value = resp.json().await.ok()?;
-
-    // simulate() ALWAYS reverts — expected revert is SimulationResults(success, result).
-    let err = json.get("error")?;
-    let revert_data_str = err.get("data").and_then(|d| d.as_str()).unwrap_or("");
-    let revert_hex = revert_data_str.strip_prefix("0x").unwrap_or(revert_data_str);
-    let revert_bytes = hex::decode(revert_hex).ok()?;
-
-    // Decode SimulationResults(bool success, bytes result).
-    let sim = IOrderMixin::SimulationResults::abi_decode(&revert_bytes).ok()?;
-    if !sim.success {
-        debug!(
-            order_id = %fusion_order.order_id,
-            "getTakingAmount inner call reverted via simulate()",
-        );
-        return None;
-    }
-
-    // Inner return value is abi.encode(uint256) — taking amount.
-    if sim.result.len() < 32 {
-        return None;
-    }
-    Some(U256::from_be_slice(&sim.result[..32]))
 }
 
 fn to_tx_input(tx: &ExecutedTx, index: u64) -> TxInput {
@@ -1096,4 +806,27 @@ fn build_block_header(block: &BlockEnv) -> BlockHeader {
         revert: false,
         partial_block_index: None,
     }
+}
+
+/// Converts a [`BigUint`] to [`U256`], clamping to [`U256::MAX`] for values that don't fit.
+pub(crate) fn biguint_to_u256(b: &BigUint) -> U256 {
+    let bytes = b.to_bytes_be();
+    if bytes.is_empty() {
+        U256::ZERO
+    } else if bytes.len() > 32 {
+        U256::MAX
+    } else {
+        U256::from_be_slice(&bytes)
+    }
+}
+
+/// Decodes a `0x`-prefixed 20-byte address hex string into `TychoBytes`.
+pub(crate) fn parse_address(hex_str: &str) -> anyhow::Result<TychoBytes> {
+    let stripped = hex_str
+        .strip_prefix("0x")
+        .ok_or_else(|| anyhow::anyhow!("missing 0x prefix: {hex_str}"))?;
+    let raw = hex::decode(stripped)
+        .map_err(|e| anyhow::anyhow!("hex-decode failed for {hex_str}: {e}"))?;
+    anyhow::ensure!(raw.len() == 20, "expected 20 bytes, got {}: {hex_str}", raw.len());
+    Ok(TychoBytes::from(raw))
 }

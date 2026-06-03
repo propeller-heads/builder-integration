@@ -9,7 +9,7 @@ mod tests {
     use alloy::primitives::{Address, U256};
     use anyhow::{Context, Result};
     use crate::abi::{build_settle_calldata, RawOrderFields, SettleParams};
-    use crate::{FusionExtOrder, IAmountGetter, IOrderMixin};
+    use crate::client::{FusionExtOrder, IAmountGetter, ILopSimulate};
 
     fn h(s: &str) -> Result<Vec<u8>> {
         hex::decode(s.replace([' ', '\n'], "")).context("hex decode")
@@ -225,7 +225,7 @@ mod tests {
         // simulate() always reverts with SimulationResults(success, result).
         let lop_addr: alloy::primitives::Address =
             "0x111111125421cA6dc452d289314280a0f8842A65".parse()?;
-        let simulate_call = IOrderMixin::simulateCall {
+        let simulate_call = ILopSimulate::simulateCall {
             target: ext_addr,
             data: alloy::primitives::Bytes::from(call.abi_encode()),
         };
@@ -275,7 +275,7 @@ mod tests {
         let revert_str = err.get("data").and_then(|d| d.as_str())
             .context("no revert data in SimulationResults")?;
         let revert_bytes = h(revert_str.strip_prefix("0x").unwrap_or(revert_str))?;
-        let sim = IOrderMixin::SimulationResults::abi_decode(&revert_bytes)
+        let sim = ILopSimulate::SimulationResults::abi_decode(&revert_bytes)
             .context("failed to decode SimulationResults")?;
         anyhow::ensure!(sim.success, "getTakingAmount inner call reverted: {:?}", sim.result);
 
