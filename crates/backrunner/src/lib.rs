@@ -38,6 +38,7 @@ use fynd_core::{
     OrderSide, PendingBlockProcessor, PendingError, QuoteOptions, QuoteRequest, Solver, SolveError,
     SolverBuildError,
 };
+use uniswap_v3_core::processor::UniswapV3Processor;
 use num_bigint::BigUint;
 use order::{amount_at_timestamp, compute_gas_bump, is_gtc_order, onchain_taking_amount, FusionOrder};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -192,6 +193,10 @@ impl Backrunner {
             config.rpc_url.clone(),
             config.protocols,
             config.min_tvl,
+        )
+        .with_pending_indexer(
+            "uniswap_v3",
+            Box::new(UniswapV3Processor::new(chain, "uniswap_v3".to_string())),
         )
         .algorithm("bellman_ford");
 
