@@ -420,3 +420,89 @@ fn log_input_to_pb(
         ..Default::default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use tycho_common::{
+        models::{
+            blockchain::{BlockAggregatedChanges, LogInput, TxInput},
+            protocol::ProtocolComponent,
+            Chain, ChangeType,
+        },
+        traits::TxDeltaIndexer,
+        Bytes,
+    };
+
+    use super::UniswapV3Processor;
+
+    fn make_processor() -> UniswapV3Processor {
+        UniswapV3Processor::new(Chain::Ethereum, "uniswap_v3".to_string())
+    }
+
+    /// Build a minimal `BlockAggregatedChanges` that registers one pool.
+    fn block_with_pool(pool_hex: &str) -> BlockAggregatedChanges {
+        let token0 = Bytes::from(vec![0xaa; 20]);
+        let token1 = Bytes::from(vec![0xbb; 20]);
+
+        let mut comp = ProtocolComponent::default();
+        comp.id = pool_hex.to_string();
+        comp.chain = Chain::Ethereum;
+        comp.change = ChangeType::Creation;
+        comp.tokens = vec![token0, token1];
+
+        let mut new_components = HashMap::new();
+        new_components.insert(pool_hex.to_string(), comp);
+
+        BlockAggregatedChanges {
+            extractor: "uniswap_v3".to_string(),
+            chain: Chain::Ethereum,
+            new_protocol_components: new_components,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_pools_returns_empty_deltas() {
+        let mut proc = make_processor();
+        let result = proc.generate_deltas(&[]);
+        assert!(result.state_deltas.is_empty());
+        assert!(result.component_balances.is_empty());
+    }
+
+    #[test]
+    fn failed_tx_is_skipped() {
+        let pool_hex = "aa".repeat(20);
+        let pool_addr = Bytes::from(hex::decode(&pool_hex).unwrap());
+
+        let mut proc = make_processor();
+        proc.apply_block(&block_with_pool(&pool_hex)).unwrap();
+
+        let log = LogInput::new(pool_addr, vec![], Bytes::default(), 0);
+        let tx = TxInput::new(
+            Bytes::from(vec![0x01; 32]),
+            Bytes::from(vec![0x02; 20]),
+            Bytes::from(vec![0x03; 20]),
+            0,
+            vec![log],
+            false, // failed
+        );
+
+        let result = proc.generate_deltas(&[tx]);
+        assert!(result.state_deltas.is_empty());
+    }
+
+    #[test]
+    fn apply_block_does_not_mutate_on_generate_deltas() {
+        let pool_hex = "cc".repeat(20);
+
+        let mut proc = make_processor();
+        proc.apply_block(&block_with_pool(&pool_hex)).unwrap();
+
+        let first = proc.generate_deltas(&[]);
+        let second = proc.generate_deltas(&[]);
+
+        assert_eq!(first.state_deltas.len(), second.state_deltas.len());
+    }
+}
