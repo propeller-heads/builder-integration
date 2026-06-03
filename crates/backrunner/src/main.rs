@@ -40,9 +40,6 @@ struct Cli {
     #[arg(long, env = "MIN_TVL", default_value_t = 1000.0)]
     min_tvl: f64,
 
-    #[arg(long, env = "WALLET_ADDRESS")]
-    wallet_address: String,
-
     #[arg(long, env = "CHAIN", default_value = "ethereum")]
     chain: String,
 
@@ -74,7 +71,6 @@ async fn main() -> Result<()> {
         tycho_api_key: cli.tycho_api_key,
         protocols: cli.protocols,
         min_tvl: cli.min_tvl,
-        wallet_address: cli.wallet_address,
         ready_timeout: Duration::from_mins(3),
         chain_id: cli.chain_id,
         resolver_address: cli.resolver_address,

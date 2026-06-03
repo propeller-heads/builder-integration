@@ -103,7 +103,7 @@ pub struct SettleParams<'a> {
     /// Max taking amount we are willing to pay (takerTraits threshold, bits 0-184).
     /// Usually `amount_out_gross` from Fynd. The LOP reverts `TakingAmountTooHigh` if the
     /// Dutch auction price exceeds this.
-    pub taking_amount: u128,
+    pub taking_amount: U256,
     /// The `amount` parameter passed to `fillOrderArgs` / `fillContractOrderArgs`.
     /// For a full fill this equals `order_fields.making_amount`. For a partial fill (when the
     /// order's remaining on-chain making amount is less than the full amount) set this to the
@@ -157,7 +157,7 @@ pub fn build_settle_calldata(p: &SettleParams<'_>) -> Bytes {
     // MAKER_AMOUNT_FLAG (bit 255): `amount` param is in maker token; threshold = max taking.
     // Without this flag the LOP treats `amount` as taker token, which would cause
     // MakingAmountTooLow when `amount = making_amount` has the wrong decimal scale.
-    let mut taker_traits = U256::from(p.taking_amount); // bits 0-184 = max taking threshold
+    let mut taker_traits = p.taking_amount; // bits 0-184 = max taking threshold
     taker_traits |= U256::from(1u64) << MAKER_AMOUNT_FLAG;
     taker_traits |= U256::from(1u64) << ARGS_HAS_TARGET_BIT;
     taker_traits |= U256::from(p.extension.len() as u64) << ARGS_EXTENSION_LENGTH_OFFSET;
@@ -240,7 +240,7 @@ mod tests {
             order_fields: &order_fields,
             signature: &[0u8; 65],
             extension: &[],
-            taking_amount: 999_u128,
+            taking_amount: U256::from(999u64),
             fill_amount: order_fields.making_amount,
             router: Address::ZERO,
             primary_swap_calldata: &[0xde, 0xad],
@@ -264,7 +264,7 @@ mod tests {
             order_fields: &order_fields,
             signature: &[0u8; 65],
             extension: &extension,
-            taking_amount: 0,
+            taking_amount: U256::ZERO,
             fill_amount: order_fields.making_amount,
             router: Address::ZERO,
             primary_swap_calldata: &[],

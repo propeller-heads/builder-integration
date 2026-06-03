@@ -101,8 +101,6 @@ pub struct BackrunnerConfig {
     pub protocols: Vec<String>,
     /// Minimum pool TVL in USD.
     pub min_tvl: f64,
-    /// Address that will send and receive backrun transactions.
-    pub wallet_address: String,
     /// How long to wait for the initial market-data snapshot before failing.
     pub ready_timeout: Duration,
     /// 1inch Fusion chain ID (1 = Ethereum mainnet).
@@ -149,22 +147,15 @@ const LOP_V4: AlloyAddress =
 /// Returns 0 if fully filled/cancelled, `U256::MAX` if never partially filled.
 const REMAINING_SELECTOR: [u8; 4] = [0x10, 0xad, 0x2c, 0x8b];
 
-/// Minimum headroom above the off-chain price estimate before issuing the fill.
-///
-/// All known root causes of systematic underestimation are now explicitly handled
-/// (duration decoded from extension bytes, gas-bump computed from actual baseFee).
-/// The on-chain `getTakingAmount` pre-flight check replaces this margin.
-const MIN_PROFIT_MARGIN_BPS: u128 = 0;
-
-/// Converts a `BigUint` to `u128`, clamping to `u128::MAX` for values that don't fit.
-fn biguint_to_u128(b: &BigUint) -> u128 {
-    let digits = b.to_u64_digits();
-    if digits.is_empty() {
-        0u128
-    } else if digits.len() > 2 {
-        u128::MAX
+/// Converts a [`BigUint`] to [`U256`], clamping to [`U256::MAX`] for values that don't fit.
+pub(crate) fn biguint_to_u256(b: &BigUint) -> U256 {
+    let bytes = b.to_bytes_be();
+    if bytes.is_empty() {
+        U256::ZERO
+    } else if bytes.len() > 32 {
+        U256::MAX
     } else {
-        digits.iter().enumerate().fold(0u128, |acc, (i, &d)| acc | (u128::from(d) << (i * 64)))
+        U256::from_be_slice(&bytes)
     }
 }
 
@@ -177,6 +168,8 @@ pub struct Backrunner {
     pub(crate) slippage: f64,
     /// RPC URL for direct on-chain queries (remaining amount, etc.).
     rpc_url: String,
+    /// Shared HTTP client for all RPC calls — reuses connection pool across requests.
+    rpc_client: reqwest::Client,
 }
 
 impl Backrunner {
@@ -219,6 +212,11 @@ impl Backrunner {
         let market_data_for_orders = solver.market_data();
         tokio::spawn(run_orderbook(Arc::new(oneinch), orders_tx, market_data_for_orders));
 
+        let rpc_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| BuildError::OneinchClient(format!("building RPC client: {e}")))?;
+
         Ok(Self {
             solver,
             pending: tokio::sync::Mutex::new(pending),
@@ -226,6 +224,7 @@ impl Backrunner {
             resolver_address: config.resolver_address,
             slippage: config.slippage,
             rpc_url: config.rpc_url.clone(),
+            rpc_client,
         })
     }
 
@@ -296,11 +295,14 @@ async fn run_orderbook(
                     patch_decimals_from_registry(&mut filtered, view.token_registry_ref());
                 }
                 let max_bump = filtered.iter()
-                    .map(|o| o.auction_start_amount.saturating_sub(o.auction_end_amount)
-                        .saturating_mul(10_000) / o.auction_end_amount.max(1))
+                    .map(|o| {
+                        let end = o.auction_end_amount.max(U256::ONE);
+                        o.auction_start_amount.saturating_sub(o.auction_end_amount)
+                            .saturating_mul(U256::from(10_000u64)) / end
+                    })
                     .max()
-                    .unwrap_or(0);
-                debug!(order_count = filtered.len(), max_init_bump_bps = max_bump, "orderbook refreshed");
+                    .unwrap_or(U256::ZERO);
+                debug!(order_count = filtered.len(), max_init_bump_bps = %max_bump, "orderbook refreshed");
                 if orders_tx.send(Arc::new(filtered)).is_err() {
                     break;
                 }
@@ -403,11 +405,13 @@ async fn evaluate_backrun(
 
     // Query on-chain remaining making amount for each active order (concurrent).
     // This detects partially-filled orders so we quote Fynd for the correct amount.
-    let rpc = backrunner.rpc_url.clone();
-    let remaining_amounts: Vec<u128> =
+    let rpc_client = backrunner.rpc_client.clone();
+    let rpc_url = backrunner.rpc_url.clone();
+    let remaining_amounts: Vec<U256> =
         futures::future::join_all(active.iter().map(|o| {
-            let rpc = rpc.clone();
-            async move { query_remaining_making_amount(&rpc, o).await }
+            let client = rpc_client.clone();
+            let url = rpc_url.clone();
+            async move { query_remaining_making_amount(&client, &url, o).await }
         }))
         .await;
 
@@ -417,15 +421,15 @@ async fn evaluate_backrun(
         .iter()
         .zip(remaining_amounts.iter())
         .filter_map(|(&order, &remaining)| {
-            if remaining == 0 {
+            if remaining.is_zero() {
                 debug!(order_id = %order.order_id, "order fully filled on-chain, skipping");
                 return None;
             }
             if remaining < order.making_amount {
                 debug!(
                     order_id = %order.order_id,
-                    making_amount = order.making_amount,
-                    remaining,
+                    making_amount = %order.making_amount,
+                    remaining = %remaining,
                     "partial fill detected — quoting Fynd for remaining amount",
                 );
             }
@@ -442,7 +446,7 @@ async fn evaluate_backrun(
     let adjusted_refs: Vec<&FusionOrder> = adjusted.iter().collect();
 
     // Build a map from order_id → remaining amount for use during settlement.
-    let remaining_map: HashMap<&str, u128> = active
+    let remaining_map: HashMap<&str, U256> = active
         .iter()
         .zip(remaining_amounts.iter())
         .map(|(&o, &r)| (o.order_id.as_str(), r.min(o.making_amount)))
@@ -479,7 +483,7 @@ async fn evaluate_backrun(
     for order_quote in quote.orders() {
         let Some(fynd_tx) = order_quote.transaction() else { continue };
         let Some(&fusion_order) = order_map.get(order_quote.order_id()) else { continue };
-        let fill_amount = remaining_map
+        let fill_amount: U256 = remaining_map
             .get(order_quote.order_id())
             .copied()
             .unwrap_or(fusion_order.making_amount);
@@ -519,7 +523,7 @@ async fn build_backrun_tx(
     fusion_order: &FusionOrder,
     order_quote: &OrderQuote,
     fynd_tx: &fynd_core::Transaction,
-    fill_amount: u128,
+    fill_amount: U256,
 ) -> Option<BackrunTx> {
     let BackrunContext { uuid, block_ts, base_fee, backrunner, .. } = ctx;
 
@@ -528,7 +532,7 @@ async fn build_backrun_tx(
     //   withFees = ceil(floor × (1e5 + totalFees) / 1e5)
     //   taking   = ceil(withFees × (1e7 + rateBump) / 1e7)
     let taking_amount_full = onchain_taking_amount(fusion_order, *block_ts, *base_fee)?;
-    let taking_amount = if fill_amount < fusion_order.making_amount && fusion_order.making_amount > 0
+    let taking_amount = if fill_amount < fusion_order.making_amount && !fusion_order.making_amount.is_zero()
     {
         taking_amount_full.saturating_mul(fill_amount) / fusion_order.making_amount
     } else {
@@ -538,29 +542,32 @@ async fn build_backrun_tx(
     let elapsed_secs = block_ts.saturating_sub(fusion_order.auction_start_time);
     let gas_bump = compute_gas_bump(fusion_order, *base_fee);
     debug!(%uuid, order_id = %fusion_order.order_id,
-        floor = fusion_order.auction_end_amount, start_amount = fusion_order.auction_start_amount,
+        floor = %fusion_order.auction_end_amount,
+        start_amount = %fusion_order.auction_start_amount,
         elapsed_secs, base_fee, gas_bump,
         total_fees_1e5 = fusion_order.total_fees_1e5,
-        points_count = fusion_order.points.len(), taking_estimate = taking_amount,
+        points_count = fusion_order.points.len(),
+        taking_estimate = %taking_amount,
         "auction price estimate");
 
-    let amount_out = biguint_to_u128(order_quote.amount_out());
-    if amount_out == 0 {
+    let amount_out = biguint_to_u256(order_quote.amount_out());
+    if amount_out.is_zero() {
         return None;
     }
 
-    let taking_with_margin =
-        taking_amount.saturating_add(taking_amount.saturating_mul(MIN_PROFIT_MARGIN_BPS) / 10_000);
-    if amount_out < taking_with_margin {
+    if amount_out < taking_amount {
         debug!(%uuid, order_id = %fusion_order.order_id,
-            amount_out, taking_amount, taking_with_margin,
-            "swap output below auction price + margin, skipping");
+            amount_out = %amount_out,
+            taking_amount = %taking_amount,
+            "swap output below auction price, skipping");
         return None;
     }
 
     debug!(%uuid, order_id = %fusion_order.order_id,
-        amount_out, taking_estimate = taking_amount,
-        margin_bps = amount_out.saturating_sub(taking_amount) * 10_000 / taking_amount.max(1),
+        amount_out = %amount_out,
+        taking_estimate = %taking_amount,
+        margin_bps = (amount_out.saturating_sub(taking_amount) * U256::from(10_000u64)
+            / taking_amount.max(U256::ONE)).saturating_to::<u64>(),
         "order passed profitability filter — querying on-chain taking amount");
 
     // Pre-flight: static-call extension.getTakingAmount to get the exact on-chain price.
@@ -571,6 +578,7 @@ async fn build_backrun_tx(
     // off-chain estimate — without it the eth_call runs at the confirmed block timestamp
     // (12 s earlier), which can land before the auction start and return the full start price.
     let onchain_taking = query_onchain_taking_amount(
+        &backrunner.rpc_client,
         &backrunner.rpc_url,
         fusion_order,
         fill_amount,
@@ -583,9 +591,10 @@ async fn build_backrun_tx(
     match onchain_taking {
         Some(onchain) if amount_out < onchain => {
             debug!(%uuid, order_id = %fusion_order.order_id,
-                amount_out, onchain_taking = onchain,
-                shortfall = onchain.saturating_sub(amount_out),
-                taking_estimate = taking_amount,
+                amount_out = %amount_out,
+                onchain_taking = %onchain,
+                shortfall = %onchain.saturating_sub(amount_out),
+                taking_estimate = %taking_amount,
                 extension_hex = %fusion_order.extension,
                 block_ts, base_fee,
                 "fynd output below on-chain taking amount, skipping");
@@ -593,9 +602,10 @@ async fn build_backrun_tx(
         }
         Some(onchain) => {
             debug!(%uuid, order_id = %fusion_order.order_id,
-                amount_out, onchain_taking = onchain,
-                surplus = amount_out.saturating_sub(onchain),
-                taking_estimate = taking_amount,
+                amount_out = %amount_out,
+                onchain_taking = %onchain,
+                surplus = %amount_out.saturating_sub(onchain),
+                taking_estimate = %taking_amount,
                 "on-chain taking amount verified, proceeding to fill");
         }
         None => debug!(%uuid, order_id = %fusion_order.order_id,
@@ -613,15 +623,15 @@ async fn assemble_backrun_tx(
     ctx: &BackrunContext<'_>,
     fusion_order: &FusionOrder,
     fynd_tx: &fynd_core::Transaction,
-    fill_amount: u128,
-    amount_out: u128,
-    taking_estimate: u128,
+    fill_amount: U256,
+    amount_out: U256,
+    taking_estimate: U256,
 ) -> Option<BackrunTx> {
     let BackrunContext { uuid, base_fee, block_number, solve_time_ms, orders_quoted, backrunner, .. } =
         ctx;
 
     let surplus_amount = amount_out.saturating_sub(taking_estimate);
-    let surplus_quote = if surplus_amount > 0 {
+    let surplus_quote = if !surplus_amount.is_zero() {
         quote_surplus_swap(
             &backrunner.solver,
             &fusion_order.to_token,
@@ -668,7 +678,7 @@ async fn assemble_backrun_tx(
         signature: &signature,
         extension: &extension,
         taking_amount: amount_out,
-        fill_amount: alloy::primitives::U256::from(fill_amount),
+        fill_amount,
         router: AlloyAddress::from_slice(fynd_tx.to().as_ref()),
         primary_swap_calldata: fynd_tx.data(),
         surplus_calldata: &surplus_calldata,
@@ -678,7 +688,7 @@ async fn assemble_backrun_tx(
 
     let raw_tx = RawTx {
         to: Some(backrunner.resolver_address),
-        value: alloy::primitives::U256::ZERO,
+        value: U256::ZERO,
         data: settle_data,
         gas_limit: 500_000,
         max_fee_per_gas: u128::from(*base_fee) * 2 + 1_000_000_000,
@@ -686,12 +696,15 @@ async fn assemble_backrun_tx(
     };
 
     let expected_profit = alloy::primitives::I256::try_from(
-        i128::try_from(surplus_amount).unwrap_or(i128::MAX),
+        i128::try_from(surplus_amount.saturating_to::<u128>()).unwrap_or(i128::MAX),
     )
     .unwrap_or_default();
 
     debug!(%uuid, block_number, solve_time_ms, orders_quoted,
-        amount_out, taking_estimate, surplus = surplus_amount, "backrun candidate built");
+        amount_out = %amount_out,
+        taking_estimate = %taking_estimate,
+        surplus = %surplus_amount,
+        "backrun candidate built");
 
     Some(BackrunTx { tx: raw_tx, expected_profit_wei: expected_profit, expected_gas: 300_000 })
 }
@@ -756,7 +769,7 @@ async fn try_evaluate(
 async fn quote_surplus_swap(
     solver: &Solver,
     token_in_hex: &str,
-    surplus_amount: u128,
+    surplus_amount: U256,
     resolver_address: AlloyAddress,
     state_label: fynd_core::StateLabel,
 ) -> Option<OrderQuote> {
@@ -767,10 +780,14 @@ async fn quote_surplus_swap(
     let from_bytes = parse_address(token_in_hex).ok()?;
     let to_bytes = parse_address(WETH_HEX).ok()?;
     let sender = TychoBytes::from(resolver_address.as_slice().to_vec());
+    let amount = {
+        let bytes = surplus_amount.to_be_bytes::<32>();
+        BigUint::from_bytes_be(&bytes)
+    };
     let order = Order::new(
         from_bytes,
         to_bytes,
-        BigUint::from(surplus_amount),
+        amount,
         OrderSide::Sell,
         sender,
     );
@@ -798,7 +815,10 @@ fn fusion_order_to_fynd(fusion: &FusionOrder, resolver_address: AlloyAddress) ->
     let to_bytes = parse_address(&fusion.to_token)
         .map_err(|e| tracing::warn!(order_id = %fusion.order_id, "bad to_token: {e}"))
         .ok()?;
-    let amount = BigUint::from(fusion.making_amount);
+    let amount = {
+        let bytes = fusion.making_amount.to_be_bytes::<32>();
+        BigUint::from_bytes_be(&bytes)
+    };
     let sender = TychoBytes::from(resolver_address.as_slice().to_vec());
     Some(
         Order::new(from_bytes, to_bytes, amount, OrderSide::Sell, sender)
@@ -807,17 +827,18 @@ fn fusion_order_to_fynd(fusion: &FusionOrder, resolver_address: AlloyAddress) ->
 }
 
 fn build_raw_order_fields(fusion: &FusionOrder) -> anyhow::Result<RawOrderFields> {
-    use alloy::primitives::U256;
     use std::str::FromStr;
     Ok(RawOrderFields {
-        salt: U256::from_str(&fusion.salt).unwrap_or_default(),
+        salt: U256::from_str(&fusion.salt)
+            .map_err(|e| anyhow::anyhow!("invalid order salt {:?}: {e}", fusion.salt))?,
         maker: address_str_to_u256(&fusion.maker_address)?,
         receiver: address_str_to_u256(&fusion.receiver_address)?,
         maker_asset: address_str_to_u256(&fusion.from_token)?,
         taker_asset: address_str_to_u256(&fusion.to_token)?,
-        making_amount: U256::from(fusion.making_amount),
-        taking_amount: U256::from(fusion.auction_end_amount),
-        maker_traits: U256::from_str(&fusion.maker_traits).unwrap_or_default(),
+        making_amount: fusion.making_amount,
+        taking_amount: fusion.auction_end_amount,
+        maker_traits: U256::from_str(&fusion.maker_traits)
+            .map_err(|e| anyhow::anyhow!("invalid maker_traits {:?}: {e}", fusion.maker_traits))?,
     })
 }
 
@@ -835,7 +856,7 @@ fn hex_to_bytes(s: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Decodes a `0x`-prefixed 20-byte address hex string into `TychoBytes`.
-fn parse_address(hex_str: &str) -> anyhow::Result<TychoBytes> {
+pub(crate) fn parse_address(hex_str: &str) -> anyhow::Result<TychoBytes> {
     let stripped = hex_str
         .strip_prefix("0x")
         .ok_or_else(|| anyhow::anyhow!("missing 0x prefix: {hex_str}"))?;
@@ -851,7 +872,11 @@ fn parse_address(hex_str: &str) -> anyhow::Result<TychoBytes> {
 /// - Returns `full_making` when the order is fresh (LOP returns `U256::MAX`) or on error.
 /// - Returns `0` when the order is fully filled or cancelled.
 /// - Returns the actual remaining making amount otherwise (clamped to `full_making`).
-async fn query_remaining_making_amount(rpc_url: &str, order: &FusionOrder) -> u128 {
+async fn query_remaining_making_amount(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    order: &FusionOrder,
+) -> U256 {
     let full = order.making_amount;
 
     // Parse maker address
@@ -885,13 +910,6 @@ async fn query_remaining_making_amount(rpc_url: &str, order: &FusionOrder) -> u1
         "id": 1
     });
 
-    let Ok(client) = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-    else {
-        return full;
-    };
-
     let Ok(resp) = client.post(rpc_url).json(&body).send().await else { return full };
 
     let json: serde_json::Value = match resp.json().await {
@@ -899,7 +917,7 @@ async fn query_remaining_making_amount(rpc_url: &str, order: &FusionOrder) -> u1
         Err(_) => return full,
     };
 
-    // Parse hex result → U256 → u128
+    // Parse hex result → U256, clamped to full_making.
     let hex_result = match json["result"].as_str() {
         Some(s) => s.strip_prefix("0x").unwrap_or(s),
         None => return full,
@@ -915,8 +933,7 @@ async fn query_remaining_making_amount(rpc_url: &str, order: &FusionOrder) -> u1
     if val == U256::MAX {
         full // fresh order: never partially filled
     } else {
-        let clamped = val.min(U256::from(full));
-        u128::try_from(clamped).unwrap_or(full)
+        val.min(full)
     }
 }
 
@@ -925,13 +942,14 @@ async fn query_remaining_making_amount(rpc_url: &str, order: &FusionOrder) -> u1
 /// Returns `None` on RPC error, malformed order data, or call revert (e.g. order expired).
 /// Callers fall back to the off-chain estimate when `None` is returned.
 async fn query_onchain_taking_amount(
+    client: &reqwest::Client,
     rpc_url: &str,
     fusion_order: &FusionOrder,
-    fill_making_amount: u128,
-    remaining_making_amount: u128,
+    fill_making_amount: U256,
+    remaining_making_amount: U256,
     resolver: AlloyAddress,
     pending_block_ts: u64,
-) -> Option<u128> {
+) -> Option<U256> {
     use alloy::sol_types::{SolCall, SolError as _};
     use std::str::FromStr;
 
@@ -975,27 +993,26 @@ async fn query_onchain_taking_amount(
             receiver: address_str_to_u256(&fusion_order.receiver_address).ok()?,
             makerAsset: address_str_to_u256(&fusion_order.from_token).ok()?,
             takerAsset: address_str_to_u256(&fusion_order.to_token).ok()?,
-            makingAmount: U256::from(fusion_order.making_amount),
-            takingAmount: U256::from(fusion_order.auction_end_amount),
+            makingAmount: fusion_order.making_amount,
+            takingAmount: fusion_order.auction_end_amount,
             makerTraits: U256::from_str(&fusion_order.maker_traits).unwrap_or_default(),
         },
         extension: alloy::primitives::Bytes::from(extension_bytes),
         orderHash: alloy::primitives::FixedBytes::from(hash_bytes),
         taker: resolver,
-        makingAmount: U256::from(fill_making_amount),
-        remainingMakingAmount: U256::from(remaining_making_amount),
+        makingAmount: fill_making_amount,
+        remainingMakingAmount: remaining_making_amount,
         extraData: taking_extra_data,
     };
 
     // Wrap in LOP.simulate(extension_addr, inner_calldata).
     // The LOP calls the extension with msg.sender == LOP and reverts with
     // SimulationResults(success, abi.encode(taking_amount)).
-    let lop_addr: AlloyAddress = "0x111111125421cA6dc452d289314280a0f8842A65".parse().ok()?;
     let simulate_call = IOrderMixin::simulateCall {
         target: ext_addr,
         data: alloy::primitives::Bytes::from(inner.abi_encode()),
     };
-    let lop_hex   = format!("0x{}", hex::encode(lop_addr.as_slice()));
+    let lop_hex   = format!("0x{}", hex::encode(LOP_V4.as_slice()));
     let data_hex  = format!("0x{}", hex::encode(simulate_call.abi_encode()));
 
     // Pass the pending block timestamp so the extension sees the same elapsed time our
@@ -1013,11 +1030,6 @@ async fn query_onchain_taking_amount(
         ],
         "id": 1
     });
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .ok()?;
 
     let resp = client.post(rpc_url).json(&body).send().await.ok()?;
     let json: serde_json::Value = resp.json().await.ok()?;
@@ -1042,8 +1054,7 @@ async fn query_onchain_taking_amount(
     if sim.result.len() < 32 {
         return None;
     }
-    let val = U256::from_be_slice(&sim.result[..32]);
-    u128::try_from(val).ok()
+    Some(U256::from_be_slice(&sim.result[..32]))
 }
 
 fn to_tx_input(tx: &ExecutedTx, index: u64) -> TxInput {

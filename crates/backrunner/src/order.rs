@@ -1,3 +1,4 @@
+use alloy::primitives::U256;
 use serde::{Deserialize, Serialize};
 
 /// Divisor for rate bumps stored in auction points and `init_rate_bump` (1e7 = 100%).
@@ -14,7 +15,7 @@ pub struct AuctionPoint {
     /// Seconds elapsed from `auction_start_time` at which this breakpoint applies.
     pub delay_secs: u64,
     /// Required `to_token` output amount at this breakpoint (= `apply_rate_bump(floor, rate_bump)`).
-    pub amount: u128,
+    pub amount: U256,
     /// Rate bump coefficient from the extension (units of 1e7).  Zero for API-decoded points.
     #[serde(default)]
     pub rate_bump: u32,
@@ -29,11 +30,11 @@ pub struct FusionOrder {
     /// Taker asset address (0x-prefixed hex, lowercase).
     pub to_token: String,
     /// Sell amount in the smallest token unit.
-    pub making_amount: u128,
+    pub making_amount: U256,
     /// Required output at the very start of the auction (most favourable for the user).
-    pub auction_start_amount: u128,
+    pub auction_start_amount: U256,
     /// Minimum acceptable output (floor, reached at `auction_duration_secs`).
-    pub auction_end_amount: u128,
+    pub auction_end_amount: U256,
     /// Total auction length in seconds.
     pub auction_duration_secs: u64,
     /// Unix timestamp at which the auction opened.
@@ -104,7 +105,7 @@ pub fn is_gtc_order(order: &FusionOrder) -> bool {
 ///
 /// Falls back to `amount_at_timestamp` semantics if `init_rate_bump == 0` (API-only decode),
 /// in which case `total_fees_1e5` is still applied if non-zero.
-pub fn onchain_taking_amount(order: &FusionOrder, unix_ts: u64, base_fee_wei: u64) -> Option<u128> {
+pub fn onchain_taking_amount(order: &FusionOrder, unix_ts: u64, base_fee_wei: u64) -> Option<U256> {
     let elapsed = elapsed_secs(order, unix_ts)?;
     let auction_bump = interpolate_rate_bump(order, elapsed);
     let gas_bump = compute_gas_bump(order, base_fee_wei);
@@ -150,20 +151,22 @@ fn interp_bump(t0: u64, b0: u128, t1: u64, b1: u128, t: u64) -> u128 {
 }
 
 /// `base + ceil(base × fees / FEE_DIVISOR)` — fee applied with 1e5 denominator.
-fn apply_fee_bump(base: u128, fees: u128) -> u128 {
+fn apply_fee_bump(base: U256, fees: u128) -> U256 {
+    let divisor = U256::from(FEE_DIVISOR);
     let increment = base
-        .saturating_mul(fees)
-        .saturating_add(FEE_DIVISOR - 1)
-        / FEE_DIVISOR;
+        .saturating_mul(U256::from(fees))
+        .saturating_add(divisor - U256::ONE)
+        / divisor;
     base.saturating_add(increment)
 }
 
 /// `base + ceil(base × bump / RATE_BUMP_DIVISOR)` — rate bump with 1e7 denominator.
-fn apply_rate_bump_order(base: u128, bump: u128) -> u128 {
+fn apply_rate_bump_order(base: U256, bump: u128) -> U256 {
+    let divisor = U256::from(RATE_BUMP_DIVISOR);
     let increment = base
-        .saturating_mul(bump)
-        .saturating_add(RATE_BUMP_DIVISOR - 1)
-        / RATE_BUMP_DIVISOR;
+        .saturating_mul(U256::from(bump))
+        .saturating_add(divisor - U256::ONE)
+        / divisor;
     base.saturating_add(increment)
 }
 
@@ -188,7 +191,7 @@ pub fn compute_gas_bump(order: &FusionOrder, base_fee_wei: u64) -> u128 {
 /// Returns `Some` when `unix_ts` is within the half-open window
 /// `[auction_start_time, auction_start_time + auction_duration_secs)`.
 /// Returns `None` when the order has expired or not yet started.
-pub fn amount_at_timestamp(order: &FusionOrder, unix_ts: u64) -> Option<u128> {
+pub fn amount_at_timestamp(order: &FusionOrder, unix_ts: u64) -> Option<U256> {
     let elapsed = elapsed_secs(order, unix_ts)?;
     let (t0, a0, t1, a1) = find_segment(order, elapsed);
     Some(interpolate(t0, a0, t1, a1, elapsed))
@@ -205,9 +208,9 @@ fn elapsed_secs(order: &FusionOrder, unix_ts: u64) -> Option<u64> {
     Some(elapsed)
 }
 
-fn find_segment(order: &FusionOrder, elapsed: u64) -> (u64, u128, u64, u128) {
+fn find_segment(order: &FusionOrder, elapsed: u64) -> (u64, U256, u64, U256) {
     let mut seg_start_t: u64 = 0;
-    let mut seg_start_a: u128 = order.auction_start_amount;
+    let mut seg_start_a: U256 = order.auction_start_amount;
 
     for point in &order.points {
         if elapsed < point.delay_secs {
@@ -220,12 +223,12 @@ fn find_segment(order: &FusionOrder, elapsed: u64) -> (u64, u128, u64, u128) {
     (seg_start_t, seg_start_a, order.auction_duration_secs, order.auction_end_amount)
 }
 
-fn interpolate(t0: u64, a0: u128, t1: u64, a1: u128, t: u64) -> u128 {
+fn interpolate(t0: u64, a0: U256, t1: u64, a1: U256, t: u64) -> U256 {
     if t1 == t0 {
         return a0;
     }
-    let span = u128::from(t1 - t0);
-    let elapsed_in_segment = u128::from(t - t0);
+    let span = U256::from(t1 - t0);
+    let elapsed_in_segment = U256::from(t - t0);
     let decay = a0.saturating_sub(a1).saturating_mul(elapsed_in_segment) / span;
     a0.saturating_sub(decay)
 }
@@ -239,9 +242,9 @@ mod tests {
             order_id: "test".into(),
             from_token: "0xa".into(),
             to_token: "0xb".into(),
-            making_amount: 1_000,
-            auction_start_amount: 1_000,
-            auction_end_amount: 800,
+            making_amount: U256::from(1_000u64),
+            auction_start_amount: U256::from(1_000u64),
+            auction_end_amount: U256::from(800u64),
             auction_duration_secs: 200,
             auction_start_time: 1_000,
             points: vec![],
@@ -276,31 +279,31 @@ mod tests {
 
     #[test]
     fn at_start_returns_start_amount() {
-        assert_eq!(amount_at_timestamp(&simple_order(), 1_000), Some(1_000));
+        assert_eq!(amount_at_timestamp(&simple_order(), 1_000), Some(U256::from(1_000u64)));
     }
 
     #[test]
     fn linear_midpoint() {
         // elapsed = 100/200 → halfway between 1000 and 800 → 900
-        assert_eq!(amount_at_timestamp(&simple_order(), 1_100), Some(900));
+        assert_eq!(amount_at_timestamp(&simple_order(), 1_100), Some(U256::from(900u64)));
     }
 
     #[test]
     fn two_segment_breakpoint() {
         let order = FusionOrder {
-            points: vec![AuctionPoint { delay_secs: 100, amount: 900, rate_bump: 0 }],
+            points: vec![AuctionPoint { delay_secs: 100, amount: U256::from(900u64), rate_bump: 0 }],
             ..simple_order()
         };
-        assert_eq!(amount_at_timestamp(&order, 1_050), Some(950));
-        assert_eq!(amount_at_timestamp(&order, 1_100), Some(900));
-        assert_eq!(amount_at_timestamp(&order, 1_150), Some(850));
+        assert_eq!(amount_at_timestamp(&order, 1_050), Some(U256::from(950u64)));
+        assert_eq!(amount_at_timestamp(&order, 1_100), Some(U256::from(900u64)));
+        assert_eq!(amount_at_timestamp(&order, 1_150), Some(U256::from(850u64)));
     }
 
     #[test]
     fn is_gtc_detects_flat_long_order() {
         let gtc = FusionOrder {
-            auction_start_amount: 1_000,
-            auction_end_amount: 1_000,
+            auction_start_amount: U256::from(1_000u64),
+            auction_end_amount: U256::from(1_000u64),
             auction_duration_secs: 7_200,
             ..simple_order()
         };
@@ -315,16 +318,16 @@ mod tests {
     #[test]
     fn integer_arithmetic_on_wei_scale() {
         let order = FusionOrder {
-            making_amount: 1_000_000_000_000_000_000,
-            auction_start_amount: 1_001_000_000_000_000_000,
-            auction_end_amount: 1_000_000_000_000_000_000,
+            making_amount: U256::from(1_000_000_000_000_000_000u128),
+            auction_start_amount: U256::from(1_001_000_000_000_000_000u128),
+            auction_end_amount: U256::from(1_000_000_000_000_000_000u128),
             auction_duration_secs: 180,
             auction_start_time: 1_000,
             ..simple_order()
         };
         assert_eq!(
             amount_at_timestamp(&order, 1_090),
-            Some(1_000_500_000_000_000_000u128)
+            Some(U256::from(1_000_500_000_000_000_000u128))
         );
     }
 
@@ -348,9 +351,9 @@ mod tests {
             order_id: "0x9d7a1175ffd8e3b62e32c68657a1fa7bc08a7d8f07161a31ce9ce14560448c54".into(),
             from_token: "0xfaba6f8e4a5e8ab82f62fe7c39859fa577269be3".into(),
             to_token: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),
-            making_amount: 307_671_843_799_523_540,
-            auction_start_amount: 14_581_144_812_870_894,
-            auction_end_amount:   13_632_559_937_529_719,
+            making_amount: U256::from(307_671_843_799_523_540u128),
+            auction_start_amount: U256::from(14_581_144_812_870_894u128),
+            auction_end_amount:   U256::from(13_632_559_937_529_719u128),
             auction_duration_secs: 360,
             auction_start_time:    1_780_413_608,
             points: vec![],
@@ -378,7 +381,7 @@ mod tests {
         // pending_ts = startTime + 3 = 1_780_413_611
         assert_eq!(
             amount_at_timestamp(&faba_order(), 1_780_413_611),
-            Some(14_573_239_938_909_718),
+            Some(U256::from(14_573_239_938_909_718u128)),
         );
     }
 
@@ -395,11 +398,12 @@ mod tests {
         // Base fee from confirmed block 25230552: 1_871_798_811 wei.
         let bump = compute_gas_bump(&faba_order(), 1_871_798_811);
         assert_eq!(bump, 309_453);
-        let taking = faba_order().auction_end_amount
-            .saturating_mul(bump)
-            .saturating_add(9_999_999)
-            / 10_000_000;
-        assert_eq!(taking, 421_863_657_034_839);
+        let floor = faba_order().auction_end_amount;
+        let taking = floor
+            .saturating_mul(U256::from(bump))
+            .saturating_add(U256::from(9_999_999u64))
+            / U256::from(10_000_000u64);
+        assert_eq!(taking, U256::from(421_863_657_034_839u128));
     }
 
     #[test]
@@ -413,10 +417,10 @@ mod tests {
         let auction_price = amount_at_timestamp(&order, block_ts).expect("within auction window");
         let gas_bump      = compute_gas_bump(&order, base_fee);
         let gas_bump_tak  = order.auction_end_amount
-            .saturating_mul(gas_bump)
-            .saturating_add(9_999_999)
-            / 10_000_000;
-        assert_eq!(auction_price + gas_bump_tak, 14_995_103_595_944_557);
+            .saturating_mul(U256::from(gas_bump))
+            .saturating_add(U256::from(9_999_999u64))
+            / U256::from(10_000_000u64);
+        assert_eq!(auction_price + gas_bump_tak, U256::from(14_995_103_595_944_557u128));
     }
 
     /// WETH→USDT order from `encode_test.rs` (block 25222660).
@@ -430,9 +434,9 @@ mod tests {
             order_id: "0xddc5239bef2a6f7afc8967384e209ec5548215abda64e5a68e89e7e0741f2090".into(),
             from_token: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),
             to_token:   "0xdac17f958d2ee523a2206206994597c13d831ec7".into(),
-            making_amount: 671_300_000_000_000_000,
-            auction_start_amount: 1_334_973_822,
-            auction_end_amount:   1_327_889_927,
+            making_amount: U256::from(671_300_000_000_000_000u128),
+            auction_start_amount: U256::from(1_334_973_822u64),
+            auction_end_amount:   U256::from(1_327_889_927u64),
             auction_duration_secs: 180,
             auction_start_time:    1_780_318_371,
             points: vec![],
@@ -459,7 +463,7 @@ mod tests {
     fn usdt_auction_at_start() {
         assert_eq!(
             amount_at_timestamp(&usdt_order(), 1_780_318_371),
-            Some(1_334_973_822),
+            Some(U256::from(1_334_973_822u64)),
         );
     }
 
@@ -469,7 +473,7 @@ mod tests {
         // result = 1334973822 - 1062584 = 1333911238
         assert_eq!(
             amount_at_timestamp(&usdt_order(), 1_780_318_398),
-            Some(1_333_911_238),
+            Some(U256::from(1_333_911_238u64)),
         );
     }
 
@@ -477,7 +481,7 @@ mod tests {
     fn usdt_auction_at_elapsed_90s() {
         assert_eq!(
             amount_at_timestamp(&usdt_order(), 1_780_318_461),
-            Some(1_331_431_875),
+            Some(U256::from(1_331_431_875u64)),
         );
     }
 
@@ -512,9 +516,9 @@ mod tests {
             order_id: "0x24d971ccc1964e91b28518779ed29cbcb4496849fd463791b99645f9d01a0c69".into(),
             from_token: "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984".into(),
             to_token:   "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
-            making_amount:        22_379_390_100_267_360_763,
-            auction_start_amount: 61_805_862,
-            auction_end_amount:   60_227_591,
+            making_amount:        U256::from(22_379_390_100_267_360_763u128),
+            auction_start_amount: U256::from(61_805_862u64),
+            auction_end_amount:   U256::from(60_227_591u64),
             auction_duration_secs: 360,
             auction_start_time:    1_780_417_845,
             points: vec![],
@@ -540,8 +544,8 @@ mod tests {
     fn uni_order_with_pts() -> FusionOrder {
         FusionOrder {
             points: vec![
-                AuctionPoint { delay_secs: 24,  amount: 61_744_116, rate_bump: 0 },
-                AuctionPoint { delay_secs: 360, amount: 60_990_838, rate_bump: 0 },
+                AuctionPoint { delay_secs: 24,  amount: U256::from(61_744_116u64), rate_bump: 0 },
+                AuctionPoint { delay_secs: 360, amount: U256::from(60_990_838u64), rate_bump: 0 },
             ],
             ..uni_order_no_pts()
         }
@@ -569,15 +573,15 @@ mod tests {
             order_id: "0x1dca545afebf78140bb8fc7807401cc57f4cec36f7cf6d3f7e8f1e7e535ff3c6".into(),
             from_token: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),
             to_token:   "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
-            making_amount: 100_000_000_000_000_000,
-            auction_start_amount: 588_410_953,
-            auction_end_amount:   584_777_961,
+            making_amount: U256::from(100_000_000_000_000_000u128),
+            auction_start_amount: U256::from(588_410_953u64),
+            auction_end_amount:   U256::from(584_777_961u64),
             auction_duration_secs: 180,
             auction_start_time:    1_780_417_052,
             points: vec![
-                AuctionPoint { delay_secs:  60, amount: 587_723_897, rate_bump: 50_377 },
-                AuctionPoint { delay_secs: 144, amount: 587_715_642, rate_bump: 50_236 },
-                AuctionPoint { delay_secs: 180, amount: 584_785_334, rate_bump:    126 },
+                AuctionPoint { delay_secs:  60, amount: U256::from(587_723_897u64), rate_bump: 50_377 },
+                AuctionPoint { delay_secs: 144, amount: U256::from(587_715_642u64), rate_bump: 50_236 },
+                AuctionPoint { delay_secs: 180, amount: U256::from(584_785_334u64), rate_bump:    126 },
             ],
             from_token_symbol: Some("WETH".into()),
             to_token_symbol:   Some("USDC".into()),
@@ -612,7 +616,7 @@ mod tests {
         // elapsed=2: decay = (61_805_862 - 60_227_591) * 2 / 360 = 8_768 (floor div)
         assert_eq!(
             amount_at_timestamp(&uni_order_no_pts(), 1_780_417_847),
-            Some(61_797_094),
+            Some(U256::from(61_797_094u64)),
         );
     }
 
@@ -622,7 +626,7 @@ mod tests {
         // decay = (61_805_862 - 61_744_116) * 2 / 24 = 5_145 (floor div)
         assert_eq!(
             amount_at_timestamp(&uni_order_with_pts(), 1_780_417_847),
-            Some(61_800_717),
+            Some(U256::from(61_800_717u64)),
         );
     }
 
@@ -638,10 +642,10 @@ mod tests {
         let price    = amount_at_timestamp(&order, block_ts).expect("within auction window");
         let gas_bump = compute_gas_bump(&order, base_fee);
         let gas_bump_taking = order.auction_end_amount
-            .saturating_mul(gas_bump)
-            .saturating_add(9_999_999)
-            / 10_000_000;
-        assert_eq!(price + gas_bump_taking, 62_473_396);
+            .saturating_mul(U256::from(gas_bump))
+            .saturating_add(U256::from(9_999_999u64))
+            / U256::from(10_000_000u64);
+        assert_eq!(price + gas_bump_taking, U256::from(62_473_396u64));
     }
 
     #[test]
@@ -675,7 +679,7 @@ mod tests {
         //   final    = ceil(586_532_295 * 10_050_155 / 10_000_000) = 589_474_048
         assert_eq!(
             onchain_taking_amount(&dca_order(), 1_780_417_175, 2_310_734_453),
-            Some(589_474_048),
+            Some(U256::from(589_474_048u64)),
         );
     }
 

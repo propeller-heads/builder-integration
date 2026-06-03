@@ -1,5 +1,6 @@
 //! Client for the 1inch Fusion public orders API.
 
+use alloy::primitives::U256;
 use anyhow::{bail, Context};
 use chrono::DateTime;
 use reqwest::Client;
@@ -26,11 +27,12 @@ fn known_decimals(address_lower: &str) -> Option<u8> {
 ///
 /// Matches the on-chain `calcAuctionTakingAmount` which uses `mulDiv(..., Ceil)`.
 /// Ceiling: add `RATE_BUMP_DIVISOR - 1` before truncating division.
-fn apply_rate_bump(base: u128, bump: u128) -> u128 {
+fn apply_rate_bump(base: U256, bump: u128) -> U256 {
+    let divisor = U256::from(RATE_BUMP_DIVISOR);
     let increment = base
-        .saturating_mul(bump)
-        .saturating_add(RATE_BUMP_DIVISOR - 1)
-        / RATE_BUMP_DIVISOR;
+        .saturating_mul(U256::from(bump))
+        .saturating_add(divisor - U256::ONE)
+        / divisor;
     base.saturating_add(increment)
 }
 
@@ -143,9 +145,13 @@ impl OneinchClient {
 }
 
 fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
-    let making_amount: u128 = item.order.making_amount.parse().context("makingAmount")?;
-    let taking_amount: u128 = item.order.taking_amount.parse().context("takingAmount")?;
-    if taking_amount == 0 {
+    let making_amount = U256::from(
+        item.order.making_amount.parse::<u128>().context("makingAmount")?
+    );
+    let taking_amount = U256::from(
+        item.order.taking_amount.parse::<u128>().context("takingAmount")?
+    );
+    if taking_amount.is_zero() {
         bail!("takingAmount is zero");
     }
 
@@ -175,14 +181,12 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
     let ext_params = decode_extension_params(&item.extension);
     let auction_start_ts = ext_params.as_ref().map_or(auction_start_ts, |p| p.start_time);
     let auction_duration_secs = ext_params.as_ref().map_or(api_duration_secs, |p| p.duration);
-    let eff_initial_rate_bump = ext_params.as_ref()
+    let eff_initial_rate_bump: u128 = ext_params.as_ref()
         .map_or_else(|| u128::from(item.initial_rate_bump), |p| u128::from(p.init_rate_bump));
     let gas_bump_estimate       = ext_params.as_ref().map_or(0, |p| p.gas_bump_estimate);
     let gas_price_estimate_mwei = ext_params.as_ref().map_or(0, |p| p.gas_price_estimate_mwei);
     let init_rate_bump          = ext_params.as_ref().map_or(0, |p| p.init_rate_bump);
     let total_fees_1e5          = ext_params.as_ref().map_or(0, |p| p.total_fees);
-
-    let auction_start_amount = apply_rate_bump(taking_amount, eff_initial_rate_bump);
 
     // Prefer extension-decoded points: the 1inch API frequently returns empty points
     // for orders that DO have extension breakpoints, causing systematic underestimation.
@@ -216,7 +220,7 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
             pts.push(AuctionPoint {
                 delay_secs: cum,
                 amount: apply_rate_bump(taking_amount, p.coefficient),
-                rate_bump: 0,
+                rate_bump: 0_u32,
             });
         }
         pts
@@ -238,7 +242,7 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
         from_token: item.order.maker_asset,
         to_token: item.order.taker_asset,
         making_amount,
-        auction_start_amount,
+        auction_start_amount: apply_rate_bump(taking_amount, eff_initial_rate_bump),
         auction_end_amount: taking_amount,
         auction_duration_secs,
         auction_start_time: auction_start_ts,

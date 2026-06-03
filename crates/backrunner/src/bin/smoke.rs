@@ -129,7 +129,6 @@ async fn main() -> Result<()> {
             "fluid_v1".to_owned(),
         ],
         min_tvl: 10.0,
-        wallet_address: "0x0000000000000000000000000000000000000000".to_owned(),
         ready_timeout: Duration::from_mins(READY_TIMEOUT_MINS),
         chain_id,
         resolver_address: resolver_addr,

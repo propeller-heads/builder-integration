@@ -103,7 +103,7 @@ mod tests {
             order_fields: &order,
             signature: &signature,
             extension: &extension,
-            taking_amount: 1_327_889_927_u128,
+            taking_amount: U256::from(1_327_889_927_u64),
             fill_amount: U256::from(671_300_000_000_000_000_u128),
             router: fynd_router,
             primary_swap_calldata: &primary_swap_calldata,
