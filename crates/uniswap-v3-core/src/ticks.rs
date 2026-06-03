@@ -10,6 +10,7 @@ pub struct TickDelta {
     pub liquidity_net_delta: BigInt,
 }
 
+#[must_use]
 pub fn event_to_tick_deltas(event: &PoolEvent) -> Vec<TickDelta> {
     match &event.kind {
         PoolEventKind::Mint { tick_lower, tick_upper, amount, .. } => {

@@ -353,11 +353,19 @@ fn decode_extension_params(extension_hex: &str) -> Option<ExtensionParams> {
     })
 }
 
+fn parse_iso_timestamp(s: &str) -> anyhow::Result<u64> {
+    let dt = DateTime::parse_from_rfc3339(s)
+        .with_context(|| format!("not a valid RFC 3339 timestamp: {s:?}"))?;
+    u64::try_from(dt.timestamp())
+        .with_context(|| format!("negative unix timestamp in {s:?}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test assertion helper")]
     fn decode_extension_params_parses_two_points_and_fee() {
         // Synthetic: 32-byte header + 20-byte address + fixed fields + 2 points + fee bytes.
         // timeDelta values are RELATIVE (not cumulative).
@@ -389,6 +397,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test assertion helper")]
     fn decode_extension_params_zero_points() {
         let ext = concat!(
             "0x",
@@ -407,11 +416,4 @@ mod tests {
         assert!(decode_extension_params("0x00").is_none());
         assert!(decode_extension_params("0x").is_none());
     }
-}
-
-fn parse_iso_timestamp(s: &str) -> anyhow::Result<u64> {
-    let dt = DateTime::parse_from_rfc3339(s)
-        .with_context(|| format!("not a valid RFC 3339 timestamp: {s:?}"))?;
-    u64::try_from(dt.timestamp())
-        .with_context(|| format!("negative unix timestamp in {s:?}"))
 }

@@ -23,11 +23,13 @@ impl From<BalanceDelta> for ProtoBalanceDelta {
     }
 }
 
+#[must_use]
 pub fn event_to_balance_deltas(event: &PoolEvent) -> Vec<BalanceDelta> {
     let component_id = event.pool_address.clone();
 
     match &event.kind {
-        PoolEventKind::Mint { amount0, amount1, .. } => vec![
+        PoolEventKind::Mint { amount0, amount1, .. }
+        | PoolEventKind::Swap { amount0, amount1, .. } => vec![
             BalanceDelta {
                 token: event.token0.clone(),
                 component_id: component_id.clone(),
@@ -39,7 +41,8 @@ pub fn event_to_balance_deltas(event: &PoolEvent) -> Vec<BalanceDelta> {
                 delta: BigInt::from_str(amount1).unwrap_or_default(),
             },
         ],
-        PoolEventKind::Collect { amount0, amount1 } => vec![
+        PoolEventKind::Collect { amount0, amount1 }
+        | PoolEventKind::CollectProtocol { amount0, amount1 } => vec![
             BalanceDelta {
                 token: event.token0.clone(),
                 component_id: component_id.clone(),
@@ -49,19 +52,6 @@ pub fn event_to_balance_deltas(event: &PoolEvent) -> Vec<BalanceDelta> {
                 token: event.token1.clone(),
                 component_id,
                 delta: -BigInt::from_str(amount1).unwrap_or_default(),
-            },
-        ],
-        PoolEventKind::Burn { .. } => vec![],
-        PoolEventKind::Swap { amount0, amount1, .. } => vec![
-            BalanceDelta {
-                token: event.token0.clone(),
-                component_id: component_id.clone(),
-                delta: BigInt::from_str(amount0).unwrap_or_default(),
-            },
-            BalanceDelta {
-                token: event.token1.clone(),
-                component_id,
-                delta: BigInt::from_str(amount1).unwrap_or_default(),
             },
         ],
         PoolEventKind::Flash { paid0, paid1 } => vec![
@@ -74,18 +64,6 @@ pub fn event_to_balance_deltas(event: &PoolEvent) -> Vec<BalanceDelta> {
                 token: event.token1.clone(),
                 component_id,
                 delta: BigInt::from_str(paid1).unwrap_or_default(),
-            },
-        ],
-        PoolEventKind::CollectProtocol { amount0, amount1 } => vec![
-            BalanceDelta {
-                token: event.token0.clone(),
-                component_id: component_id.clone(),
-                delta: -BigInt::from_str(amount0).unwrap_or_default(),
-            },
-            BalanceDelta {
-                token: event.token1.clone(),
-                component_id,
-                delta: -BigInt::from_str(amount1).unwrap_or_default(),
             },
         ],
         _ => vec![],

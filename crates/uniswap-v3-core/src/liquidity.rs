@@ -15,6 +15,7 @@ pub struct LiquidityDelta {
     pub kind: LiquidityChangeKind,
 }
 
+#[must_use]
 pub fn event_to_liquidity_delta(current_tick: i64, event: &PoolEvent) -> Option<LiquidityDelta> {
     match &event.kind {
         PoolEventKind::Mint { tick_lower, tick_upper, amount, .. } => {
@@ -75,7 +76,7 @@ mod tests {
         });
         let result = event_to_liquidity_delta(0, &event);
         assert!(result.is_some());
-        let d = result.unwrap();
+        let d = result.expect("mint in range should return Some");
         assert_eq!(d.value, BigInt::from(5000));
         assert!(matches!(d.kind, LiquidityChangeKind::Delta));
     }
@@ -101,7 +102,7 @@ mod tests {
             liquidity: "9999".to_string(),
             tick: 50,
         });
-        let result = event_to_liquidity_delta(0, &event).unwrap();
+        let result = event_to_liquidity_delta(0, &event).expect("swap should return Some");
         assert_eq!(result.value, BigInt::from(9999));
         assert!(matches!(result.kind, LiquidityChangeKind::Absolute));
     }

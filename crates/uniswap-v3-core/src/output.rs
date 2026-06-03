@@ -11,27 +11,11 @@ pub struct AttributeUpdate {
     pub is_creation: bool,
 }
 
+#[must_use]
 pub fn event_to_attribute_updates(event: &PoolEvent) -> Vec<AttributeUpdate> {
     match &event.kind {
-        PoolEventKind::Initialize { sqrt_price, tick } => {
-            vec![
-                AttributeUpdate {
-                    pool_address: event.pool_address.clone(),
-                    name: "sqrt_price_x96".to_string(),
-                    value: BigInt::from_str(sqrt_price)
-                        .unwrap_or_default()
-                        .to_signed_bytes_be(),
-                    is_creation: false,
-                },
-                AttributeUpdate {
-                    pool_address: event.pool_address.clone(),
-                    name: "tick".to_string(),
-                    value: BigInt::from(*tick).to_signed_bytes_be(),
-                    is_creation: false,
-                },
-            ]
-        }
-        PoolEventKind::Swap { sqrt_price, tick, .. } => {
+        PoolEventKind::Initialize { sqrt_price, tick }
+        | PoolEventKind::Swap { sqrt_price, tick, .. } => {
             vec![
                 AttributeUpdate {
                     pool_address: event.pool_address.clone(),

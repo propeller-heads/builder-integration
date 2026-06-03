@@ -31,7 +31,7 @@ pub struct UniswapV3Processor {
     last_block: Option<Block>,
     finalized_block_height: u64,
     pools: HashMap<String, Pool>,
-    /// Keyed by (component_hex_id, token_hex) -> running balance
+    /// Keyed by `(component_hex_id, token_hex)` -> running balance
     balances: HashMap<(String, String), BigInt>,
     tick_liquidity: HashMap<(String, i32), BigInt>,
     current_tick: HashMap<String, i64>,
@@ -166,6 +166,7 @@ impl TxDeltaIndexer for UniswapV3Processor {
 }
 
 impl UniswapV3Processor {
+    #[must_use]
     pub fn new(chain: Chain, extractor: String) -> Self {
         Self {
             chain,
@@ -219,7 +220,8 @@ impl UniswapV3Processor {
             if attr_name == "tick" {
                 let tick_val = BigInt::from_signed_bytes_be(attr_val.as_ref());
                 let (sign, digits) = tick_val.to_u64_digits();
-                let magnitude = digits.first().copied().unwrap_or(0) as i64;
+                let magnitude = i64::try_from(digits.first().copied().unwrap_or(0))
+                    .unwrap_or(i64::MAX);
                 let tick_i64 = if sign == Sign::Minus { -magnitude } else { magnitude };
                 self.current_tick
                     .insert(component_id.to_string(), tick_i64);
@@ -299,7 +301,7 @@ impl UniswapV3Processor {
 
             let hash_key = tx.hash().to_vec();
             let Some((_, builder)) = tx_builders.get_mut(&hash_key) else { continue };
-            for event in events {
+            for event in &events {
                 self.apply_event(event, builder);
             }
         }
@@ -313,15 +315,15 @@ impl UniswapV3Processor {
             .collect()
     }
 
-    fn apply_event(&mut self, event: PoolEvent, builder: &mut TransactionChangesBuilder) {
+    fn apply_event(&mut self, event: &PoolEvent, builder: &mut TransactionChangesBuilder) {
         let pool_hex = hex::encode(&event.pool_address);
 
-        if let Some(new_tick) = event_to_current_tick(&event) {
+        if let Some(new_tick) = event_to_current_tick(event) {
             self.current_tick
                 .insert(pool_hex.clone(), new_tick);
         }
 
-        for delta in event_to_balance_deltas(&event) {
+        for delta in event_to_balance_deltas(event) {
             let token_hex = hex::encode(&delta.token);
             let running = self
                 .balances
@@ -342,7 +344,7 @@ impl UniswapV3Processor {
             });
         }
 
-        for tick_delta in event_to_tick_deltas(&event) {
+        for tick_delta in event_to_tick_deltas(event) {
             let key = (pool_hex.clone(), tick_delta.tick_index);
             let existed_before = self.tick_liquidity.contains_key(&key)
                 || self.baseline_tick_keys.contains(&key);
@@ -369,11 +371,11 @@ impl UniswapV3Processor {
         }
 
         let cur_tick = *self.current_tick.get(&pool_hex).unwrap_or(&0);
-        if let Some(liq_delta) = event_to_liquidity_delta(cur_tick, &event) {
+        if let Some(liq_delta) = event_to_liquidity_delta(cur_tick, event) {
             let running = self.pool_liquidity.entry(pool_hex.clone()).or_default();
             match liq_delta.kind {
                 LiquidityChangeKind::Delta => *running += &liq_delta.value,
-                LiquidityChangeKind::Absolute => *running = liq_delta.value.clone(),
+                LiquidityChangeKind::Absolute => running.clone_from(&liq_delta.value),
             }
             builder.add_entity_change(&EntityChanges {
                 component_id: pool_hex.clone(),
@@ -385,7 +387,7 @@ impl UniswapV3Processor {
             });
         }
 
-        for attr_update in event_to_attribute_updates(&event) {
+        for attr_update in event_to_attribute_updates(event) {
             let comp_id = hex::encode(&attr_update.pool_address);
             let change_type = if attr_update.is_creation {
                 ChangeType::Creation
@@ -413,7 +415,7 @@ fn log_input_to_pb(
         topics: log
             .topics()
             .iter()
-            .map(|t| t.to_vec())
+            .map(tycho_common::Bytes::to_vec)
             .collect(),
         data: log.data().to_vec(),
         ordinal,
@@ -446,11 +448,13 @@ mod tests {
         let token0 = Bytes::from(vec![0xaa; 20]);
         let token1 = Bytes::from(vec![0xbb; 20]);
 
-        let mut comp = ProtocolComponent::default();
-        comp.id = pool_hex.to_string();
-        comp.chain = Chain::Ethereum;
-        comp.change = ChangeType::Creation;
-        comp.tokens = vec![token0, token1];
+        let comp = ProtocolComponent {
+            id: pool_hex.to_string(),
+            chain: Chain::Ethereum,
+            change: ChangeType::Creation,
+            tokens: vec![token0, token1],
+            ..Default::default()
+        };
 
         let mut new_components = HashMap::new();
         new_components.insert(pool_hex.to_string(), comp);
@@ -474,10 +478,10 @@ mod tests {
     #[test]
     fn failed_tx_is_skipped() {
         let pool_hex = "aa".repeat(20);
-        let pool_addr = Bytes::from(hex::decode(&pool_hex).unwrap());
+        let pool_addr = Bytes::from(hex::decode(&pool_hex).expect("valid hex"));
 
         let mut proc = make_processor();
-        proc.apply_block(&block_with_pool(&pool_hex)).unwrap();
+        proc.apply_block(&block_with_pool(&pool_hex)).expect("apply_block");
 
         let log = LogInput::new(pool_addr, vec![], Bytes::default(), 0);
         let tx = TxInput::new(
@@ -498,7 +502,7 @@ mod tests {
         let pool_hex = "cc".repeat(20);
 
         let mut proc = make_processor();
-        proc.apply_block(&block_with_pool(&pool_hex)).unwrap();
+        proc.apply_block(&block_with_pool(&pool_hex)).expect("apply_block");
 
         let first = proc.generate_deltas(&[]);
         let second = proc.generate_deltas(&[]);

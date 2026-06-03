@@ -336,13 +336,13 @@ mod tests {
 
     /// FABA→WETH order captured at block 25230553.
     ///
-    /// Extension params decoded from TakingAmountData:
-    ///   startTime=1780413608, duration=360s, initialRateBump=695823
-    ///   floor=13_632_559_937_529_719 (order.takingAmount)
-    ///   start_amount=apply_rate_bump(floor, 695823)=14_581_144_812_870_894
+    /// Extension params decoded from `TakingAmountData`:
+    /// - `startTime=1780413608`, `duration=360s`, `initialRateBump=695823`
+    /// - `floor=13_632_559_937_529_719` (order.takingAmount)
+    /// - `start_amount=14_581_144_812_870_894`
     ///
-    /// Ground truth: smoke run 3 log with base_fee=0 → gas_bump=0.
-    ///   taking_estimate=14573239938909718 at pending_ts=1780413611 (elapsed=3s)
+    /// Ground truth: smoke run 3 log with `base_fee=0` → `gas_bump=0`.
+    /// - `taking_estimate=14573239938909718` at `pending_ts=1780413611` (elapsed=3s)
     fn faba_order() -> FusionOrder {
         FusionOrder {
             order_id: "0x9d7a1175ffd8e3b62e32c68657a1fa7bc08a7d8f07161a31ce9ce14560448c54".into(),
@@ -403,13 +403,14 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test assertion helper")]
     fn faba_full_estimate_at_elapsed_3s() {
         // Combined auction price + gas bump — the value compared against amount_out.
         let order = faba_order();
         let block_ts = 1_780_413_611_u64;
         let base_fee = 1_871_798_811_u64;
 
-        let auction_price = amount_at_timestamp(&order, block_ts).unwrap();
+        let auction_price = amount_at_timestamp(&order, block_ts).expect("within auction window");
         let gas_bump      = compute_gas_bump(&order, base_fee);
         let gas_bump_tak  = order.auction_end_amount
             .saturating_mul(gas_bump)
@@ -418,12 +419,12 @@ mod tests {
         assert_eq!(auction_price + gas_bump_tak, 14_995_103_595_944_557);
     }
 
-    /// WETH→USDT order from encode_test.rs (block 25222660).
+    /// WETH→USDT order from `encode_test.rs` (block 25222660).
     ///
-    /// Extension params decoded from TakingAmountData:
-    ///   startTime=1780318371, duration=180s, initialRateBump=53347
-    ///   floor=1_327_889_927, start_amount=1_334_973_822
-    ///   gasBumpEstimate=3080, gasPriceEstimate=336 Mwei
+    /// Extension params decoded from `TakingAmountData`:
+    /// - `startTime=1780318371`, `duration=180s`, `initialRateBump=53347`
+    /// - `floor=1_327_889_927`, `start_amount=1_334_973_822`
+    /// - `gasBumpEstimate=3080`, `gasPriceEstimate=336 Mwei`
     fn usdt_order() -> FusionOrder {
         FusionOrder {
             order_id: "0xddc5239bef2a6f7afc8967384e209ec5548215abda64e5a68e89e7e0741f2090".into(),
@@ -626,6 +627,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test assertion helper")]
     fn uni_full_estimate_no_points() {
         // Reproduces the logged taking_estimate=62_473_396 exactly.
         // smoke run 4: "auction price estimate ... taking_estimate=62473396"
@@ -633,7 +635,7 @@ mod tests {
         let block_ts = 1_780_417_847_u64;
         let base_fee = 1_269_763_641_u64;
 
-        let price    = amount_at_timestamp(&order, block_ts).unwrap();
+        let price    = amount_at_timestamp(&order, block_ts).expect("within auction window");
         let gas_bump = compute_gas_bump(&order, base_fee);
         let gas_bump_taking = order.auction_end_amount
             .saturating_mul(gas_bump)

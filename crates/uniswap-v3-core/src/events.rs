@@ -39,143 +39,86 @@ pub struct PoolEvent {
     pub kind: PoolEventKind,
 }
 
+#[must_use]
 pub fn decode_log(
     log: &substreams_ethereum::pb::eth::v2::Log,
     pool: &Pool,
     tx: &TxRef,
 ) -> Option<PoolEvent> {
-    let tx_ref = TxRef {
-        hash: tx.hash.clone(),
-        from: tx.from.clone(),
-        to: tx.to.clone(),
-        index: tx.index,
-    };
+    let kind = decode_kind(log)?;
+    Some(PoolEvent {
+        log_ordinal: log.ordinal,
+        pool_address: pool.address.clone(),
+        token0: pool.token0.clone(),
+        token1: pool.token1.clone(),
+        tx: TxRef { hash: tx.hash.clone(), from: tx.from.clone(), to: tx.to.clone(), index: tx.index },
+        kind,
+    })
+}
 
+fn decode_kind(log: &substreams_ethereum::pb::eth::v2::Log) -> Option<PoolEventKind> {
     if let Some(init) = Initialize::match_and_decode(log) {
-        return Some(PoolEvent {
-            log_ordinal: log.ordinal,
-            pool_address: pool.address.clone(),
-            token0: pool.token0.clone(),
-            token1: pool.token1.clone(),
-            tx: tx_ref,
-            kind: PoolEventKind::Initialize {
-                sqrt_price: init.sqrt_price_x96.to_string(),
-                tick: init.tick.into(),
-            },
+        return Some(PoolEventKind::Initialize {
+            sqrt_price: init.sqrt_price_x96.to_string(),
+            tick: init.tick.into(),
         });
     }
-
     if let Some(swap) = Swap::match_and_decode(log) {
-        return Some(PoolEvent {
-            log_ordinal: log.ordinal,
-            pool_address: pool.address.clone(),
-            token0: pool.token0.clone(),
-            token1: pool.token1.clone(),
-            tx: tx_ref,
-            kind: PoolEventKind::Swap {
-                amount0: swap.amount0.to_string(),
-                amount1: swap.amount1.to_string(),
-                sqrt_price: swap.sqrt_price_x96.to_string(),
-                liquidity: swap.liquidity.to_string(),
-                tick: swap.tick.into(),
-            },
+        return Some(PoolEventKind::Swap {
+            amount0: swap.amount0.to_string(),
+            amount1: swap.amount1.to_string(),
+            sqrt_price: swap.sqrt_price_x96.to_string(),
+            liquidity: swap.liquidity.to_string(),
+            tick: swap.tick.into(),
         });
     }
-
     if let Some(flash) = Flash::match_and_decode(log) {
-        return Some(PoolEvent {
-            log_ordinal: log.ordinal,
-            pool_address: pool.address.clone(),
-            token0: pool.token0.clone(),
-            token1: pool.token1.clone(),
-            tx: tx_ref,
-            kind: PoolEventKind::Flash {
-                paid0: flash.paid0.to_string(),
-                paid1: flash.paid1.to_string(),
-            },
+        return Some(PoolEventKind::Flash {
+            paid0: flash.paid0.to_string(),
+            paid1: flash.paid1.to_string(),
         });
     }
-
     if let Some(mint) = Mint::match_and_decode(log) {
-        return Some(PoolEvent {
-            log_ordinal: log.ordinal,
-            pool_address: pool.address.clone(),
-            token0: pool.token0.clone(),
-            token1: pool.token1.clone(),
-            tx: tx_ref,
-            kind: PoolEventKind::Mint {
-                tick_lower: mint.tick_lower.into(),
-                tick_upper: mint.tick_upper.into(),
-                amount: mint.amount.to_string(),
-                amount0: mint.amount0.to_string(),
-                amount1: mint.amount1.to_string(),
-            },
+        return Some(PoolEventKind::Mint {
+            tick_lower: mint.tick_lower.into(),
+            tick_upper: mint.tick_upper.into(),
+            amount: mint.amount.to_string(),
+            amount0: mint.amount0.to_string(),
+            amount1: mint.amount1.to_string(),
         });
     }
-
     if let Some(burn) = Burn::match_and_decode(log) {
-        return Some(PoolEvent {
-            log_ordinal: log.ordinal,
-            pool_address: pool.address.clone(),
-            token0: pool.token0.clone(),
-            token1: pool.token1.clone(),
-            tx: tx_ref,
-            kind: PoolEventKind::Burn {
-                tick_lower: burn.tick_lower.into(),
-                tick_upper: burn.tick_upper.into(),
-                amount: burn.amount.to_string(),
-                amount0: burn.amount0.to_string(),
-                amount1: burn.amount1.to_string(),
-            },
+        return Some(PoolEventKind::Burn {
+            tick_lower: burn.tick_lower.into(),
+            tick_upper: burn.tick_upper.into(),
+            amount: burn.amount.to_string(),
+            amount0: burn.amount0.to_string(),
+            amount1: burn.amount1.to_string(),
         });
     }
-
     if let Some(collect) = Collect::match_and_decode(log) {
-        return Some(PoolEvent {
-            log_ordinal: log.ordinal,
-            pool_address: pool.address.clone(),
-            token0: pool.token0.clone(),
-            token1: pool.token1.clone(),
-            tx: tx_ref,
-            kind: PoolEventKind::Collect {
-                amount0: collect.amount0.to_string(),
-                amount1: collect.amount1.to_string(),
-            },
+        return Some(PoolEventKind::Collect {
+            amount0: collect.amount0.to_string(),
+            amount1: collect.amount1.to_string(),
         });
     }
-
     if let Some(set_fp) = SetFeeProtocol::match_and_decode(log) {
-        return Some(PoolEvent {
-            log_ordinal: log.ordinal,
-            pool_address: pool.address.clone(),
-            token0: pool.token0.clone(),
-            token1: pool.token1.clone(),
-            tx: tx_ref,
-            kind: PoolEventKind::SetFeeProtocol {
-                fee0_new: set_fp.fee_protocol0_new.to_string(),
-                fee1_new: set_fp.fee_protocol1_new.to_string(),
-            },
+        return Some(PoolEventKind::SetFeeProtocol {
+            fee0_new: set_fp.fee_protocol0_new.to_string(),
+            fee1_new: set_fp.fee_protocol1_new.to_string(),
         });
     }
-
     if let Some(cp) = CollectProtocol::match_and_decode(log) {
-        return Some(PoolEvent {
-            log_ordinal: log.ordinal,
-            pool_address: pool.address.clone(),
-            token0: pool.token0.clone(),
-            token1: pool.token1.clone(),
-            tx: tx_ref,
-            kind: PoolEventKind::CollectProtocol {
-                amount0: cp.amount0.to_string(),
-                amount1: cp.amount1.to_string(),
-            },
+        return Some(PoolEventKind::CollectProtocol {
+            amount0: cp.amount0.to_string(),
+            amount1: cp.amount1.to_string(),
         });
     }
-
     None
 }
 
 /// Returns the new current tick if this event changes it (Swap or Initialize).
+#[must_use]
 pub fn event_to_current_tick(event: &PoolEvent) -> Option<i64> {
     match &event.kind {
         PoolEventKind::Swap { tick, .. } | PoolEventKind::Initialize { tick, .. } => {
