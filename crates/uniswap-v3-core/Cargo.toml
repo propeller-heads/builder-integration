@@ -11,6 +11,7 @@ substreams = { workspace = true }
 substreams-ethereum = { workspace = true }
 ethabi = { workspace = true }
 tycho-common = { version = ">=0.302.0" }
+anyhow = { workspace = true }
 num-bigint = { workspace = true }
 num-traits = { workspace = true }
 hex = { workspace = true }
