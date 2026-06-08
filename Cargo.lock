@@ -3034,7 +3034,9 @@ checksum = "42012b0f064e01aa58b545fe3727f90f7dd4020f4a3ea735b50344965f5a57e9"
 
 [[package]]
 name = "fynd-core"
-version = "0.62.0"
+version = "0.76.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57e8239ce4b35e9c0a9c461623f77b35c5b062ef3b74ce17f54ac73f2eb2d2ed"
 dependencies = [
  "alloy",
  "async-channel",
@@ -7081,9 +7083,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-client"
-version = "0.302.5"
+version = "0.305.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5817fb661c6babfa5fa969ac38beb8a5724e310ab4b2be63e26061b93ba6d7e"
+checksum = "911bd487a6c1eb485d8b06b1181ee007bf30dc337378562159e7d6b675aace4a"
 dependencies = [
  "async-trait",
  "backoff",
@@ -7111,9 +7113,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-common"
-version = "0.302.5"
+version = "0.305.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ef62d9f916904fdbe1ad584fbf67f362146c770b89d0492cd8a556d8c21f0b6"
+checksum = "a19338a335c5f8fdc3dff746877973102e651259054a7c80d9341274adff7c9c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7138,9 +7140,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-ethereum"
-version = "0.302.5"
+version = "0.305.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6336e7003a8d38ed0a8264092763e497ee904ce0e36570b05c9f67799b83e567"
+checksum = "fd280ae760a49c5804feab81398c7a63bf183c3c153265538a0da5155280df0d"
 dependencies = [
  "alloy",
  "async-trait",
@@ -7160,9 +7162,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-execution"
-version = "0.302.5"
+version = "0.305.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c79cbdd3f339697d04e4c9e10cd9505e626cb79d0cbb31d4876d5ba422c47d1"
+checksum = "a308eaecf8b976c887ee833ea65e535a9d14a2d0566e7981c90e9b1b371ff89d"
 dependencies = [
  "alloy",
  "chrono",
@@ -7181,9 +7183,9 @@ dependencies = [
 
 [[package]]
 name = "tycho-simulation"
-version = "0.302.5"
+version = "0.305.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31042c99d139407fc899bc9cb5bde277623bbb77b9ada53f832773b55771baeb"
+checksum = "d84900644ba230802ef1f9ff121fed5e6fb31c6ae396bfd6924e4f3a7709b0e3"
 dependencies = [
  "alloy",
  "alloy-chains",

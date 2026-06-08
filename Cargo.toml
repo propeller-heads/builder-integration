@@ -37,12 +37,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
 
-# Tycho market data (minimum version required by the fynd branch)
-tycho-simulation = ">=0.302.0"
+# Tycho market data
+tycho-simulation = "0.305.0"
 
-# Fynd route solver — local patch to fix NaN sort panic in token_gas_price.rs
-# TODO: switch back to git dep once upstream fixes partial_cmp().unwrap() at line 405
-fynd-core = { path = "/Users/kayibal/code/fynd/fynd-core" }
+# Fynd route solver
+fynd-core = "0.76.0"
 
 # HTTP client for 1inch Fusion API
 reqwest = { version = "0.12", features = ["json"] }

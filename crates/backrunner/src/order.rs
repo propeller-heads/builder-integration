@@ -141,12 +141,12 @@ fn interpolate_rate_bump(order: &FusionOrder, elapsed: u64) -> u128 {
 
 /// Linear interpolation between two (time, bump) pairs — floor division, matching Solidity.
 fn interp_bump(t0: u64, b0: u128, t1: u64, b1: u128, t: u64) -> u128 {
-    if t1 == t0 {
+    let span = u128::from(t1.saturating_sub(t0));
+    if span == 0 {
         return b0;
     }
-    let span = u128::from(t1 - t0);
-    let elapsed_in = u128::from(t - t0);
-    let remaining = u128::from(t1 - t);
+    let elapsed_in = u128::from(t.saturating_sub(t0));
+    let remaining = u128::from(t1.saturating_sub(t));
     (b0.saturating_mul(remaining).saturating_add(b1.saturating_mul(elapsed_in))) / span
 }
 
@@ -224,11 +224,11 @@ fn find_segment(order: &FusionOrder, elapsed: u64) -> (u64, U256, u64, U256) {
 }
 
 fn interpolate(t0: u64, a0: U256, t1: u64, a1: U256, t: u64) -> U256 {
-    if t1 == t0 {
+    let span = U256::from(t1.saturating_sub(t0));
+    if span.is_zero() {
         return a0;
     }
-    let span = U256::from(t1 - t0);
-    let elapsed_in_segment = U256::from(t - t0);
+    let elapsed_in_segment = U256::from(t.saturating_sub(t0));
     let decay = a0.saturating_sub(a1).saturating_mul(elapsed_in_segment) / span;
     a0.saturating_sub(decay)
 }

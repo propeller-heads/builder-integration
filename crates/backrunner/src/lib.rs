@@ -566,12 +566,24 @@ async fn build_backrun_tx(
         return None;
     }
 
+    let margin_bps = (amount_out.saturating_sub(taking_amount) * U256::from(10_000u64)
+        / taking_amount.max(U256::ONE))
+        .saturating_to::<u64>();
     debug!(%uuid, order_id = %fusion_order.order_id,
         amount_out = %amount_out,
         taking_estimate = %taking_amount,
-        margin_bps = (amount_out.saturating_sub(taking_amount) * U256::from(10_000u64)
-            / taking_amount.max(U256::ONE)).saturating_to::<u64>(),
+        margin_bps,
         "order passed profitability filter");
+
+    if let Some(route) = order_quote.route() {
+        let swaps: Vec<_> = route.swaps().iter().map(|s| {
+            format!("{}({}) {}→{} in={} out={}",
+                s.protocol(), s.component_id(),
+                s.token_in(), s.token_out(),
+                s.amount_in(), s.amount_out())
+        }).collect();
+        debug!(%uuid, order_id = %fusion_order.order_id, route = ?swaps, "route");
+    }
 
     // Optional pre-flight: static-call extension.getTakingAmount to verify the exact
     // on-chain price. Enabled only when `verify_onchain_taking` is set — adds one RPC

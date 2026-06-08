@@ -478,7 +478,7 @@ fn convert(item: ActiveOrderItem) -> anyhow::Result<FusionOrder> {
         let mut cum: u64 = 0;
         let mut pts = Vec::with_capacity(item.points.len());
         for p in &item.points {
-            cum += p.delay;
+            cum = cum.saturating_add(p.delay);
             if cum >= auction_duration_secs {
                 break;
             }
