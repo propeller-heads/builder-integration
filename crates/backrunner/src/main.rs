@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use alloy::primitives::Address as AlloyAddress;
 use anyhow::{Context, Result};
 use backrunner::{Backrunner, BackrunnerConfig};
 use builder_types::{BackrunCandidate, BuildEvent};
@@ -28,18 +29,37 @@ struct Cli {
         long,
         env = "PROTOCOLS",
         value_delimiter = ',',
-        default_values = ["uniswap_v2_ethereum", "uniswap_v3_ethereum"]
+        default_values = [
+            "uniswap_v2", "uniswap_v3", "uniswap_v4",
+            "sushiswap_v2", "pancakeswap_v2", "pancakeswap_v3",
+            "vm:maverick_v2", "fluid_v1",
+        ]
     )]
     protocols: Vec<String>,
 
     #[arg(long, env = "MIN_TVL", default_value_t = 1000.0)]
     min_tvl: f64,
 
-    #[arg(long, env = "WALLET_ADDRESS")]
-    wallet_address: String,
-
     #[arg(long, env = "CHAIN", default_value = "ethereum")]
     chain: String,
+
+    #[arg(long, env = "CHAIN_ID", default_value_t = 1)]
+    chain_id: u64,
+
+    #[arg(
+        long, env = "RESOLVER_ADDRESS",
+        default_value = "0x0000000000000000000000000000000000000000"
+    )]
+    resolver_address: AlloyAddress,
+
+    #[arg(long, env = "SLIPPAGE", default_value_t = 0.005)]
+    slippage: f64,
+
+    #[arg(long, env = "ORDERBOOK_INTERVAL_SECS", default_value_t = 12)]
+    orderbook_interval_secs: u64,
+
+    #[arg(long, env = "VERIFY_ONCHAIN_TAKING", default_value_t = false)]
+    verify_onchain_taking: bool,
 }
 
 #[tokio::main]
@@ -57,8 +77,12 @@ async fn main() -> Result<()> {
         tycho_api_key: cli.tycho_api_key,
         protocols: cli.protocols,
         min_tvl: cli.min_tvl,
-        wallet_address: cli.wallet_address,
-        ready_timeout: Duration::from_secs(180),
+        ready_timeout: Duration::from_mins(3),
+        chain_id: cli.chain_id,
+        resolver_address: cli.resolver_address,
+        slippage: cli.slippage,
+        orderbook_interval: Duration::from_secs(cli.orderbook_interval_secs),
+        verify_onchain_taking: cli.verify_onchain_taking,
     };
 
     tracing::info!("building backrunner, waiting for market data...");
