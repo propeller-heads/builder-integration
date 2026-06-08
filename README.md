@@ -1,6 +1,8 @@
 # tycho-builder-integration
 
-A backrun engine for block builders. Your builder emits events as it constructs a block. The engine finds profitable arbitrage routes from those events and publishes unsigned transaction candidates back to your pipeline.
+A backrun engine for block builders that acts as a [1inch Fusion](https://1inch.io/fusion/) resolver. At the end of each block-building iteration, it evaluates live Fusion orders against the final AMM state and finds profitable fill routes using Propellerheads' [Fynd](https://crates.io/crates/fynd-core) solver. When a route is profitable after gas, it produces a settlement transaction that your builder can append to the block.
+
+The engine subscribes to DEX state via [Tycho](https://propellerheads.xyz) and continuously watches the 1inch Fusion orderbook. As your builder constructs a block it streams executed transactions to the engine, which tracks pending AMM state in real time (currently Uniswap V3 only; see [Pending state](#in-process-recommended) below). At `IterationComplete` it runs the solver against the updated state and publishes a candidate if one is found.
 
 Two types define the integration boundary, in [`crates/builder-types/src/lib.rs`](crates/builder-types/src/lib.rs): `BuildEvent` goes in, `BackrunCandidate` comes out. Both are serde-enabled, so they cross process or network boundaries without extra work.
 
