@@ -8,9 +8,9 @@ Two types define the integration boundary, in [`crates/builder-types/src/lib.rs`
 
 **EOA.** The backrunner submits transactions through a Propellerheads-operated resolver contract. Your integration needs a dedicated EOA whose address you send to us for whitelisting. Transactions in `BackrunCandidate` are pre-built but unsigned — your builder signs them with that EOA before inclusion.
 
-**Tycho API key.** The engine subscribes to live DEX state via [Tycho](https://propellerheads.xyz). Contact Propellerheads to provision an API key. Pass it as `BackrunnerConfig::tycho_api_key`.
+**Tycho API key.** The engine subscribes to live DEX state via [Tycho](https://propellerheads.xyz). Provision an API key at [t.me/fynd_portal_bot](https://t.me/fynd_portal_bot). Pass it as `BackrunnerConfig::tycho_api_key`.
 
-Both of these require coordination with Propellerheads before your integration can go live. Reach out early.
+For questions about either prerequisite, reach out to [@tanay_j on Telegram](https://t.me/tanay_j).
 
 ## Integration modes
 
