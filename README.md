@@ -91,6 +91,38 @@ if let Some(candidate) = candidate_rx.borrow().as_ref() {
 
 Candidates are keyed by `uuid` matching the originating `IterationStart` event. Stale candidates (from a previous iteration) should be discarded.
 
+## Smoke test
+
+The `smoke` binary runs the full pipeline against live mainnet data without requiring a deployed resolver contract. It subscribes to Tycho, waits for the initial market snapshot, polls the 1inch Fusion orderbook, and issues one synthetic builder iteration per Ethereum block. For each iteration it attempts to build a candidate and validates it via `eth_call` using a bytecode state override.
+
+**Required env vars:**
+
+| Variable | Description |
+|---|---|
+| `TYCHO_URL` | Tycho WebSocket host (e.g. `tycho-beta.propellerheads.xyz`) |
+| `TYCHO_API_KEY` | Your Tycho API key |
+| `ETH_RPC_URL` | Ethereum JSON-RPC endpoint |
+
+**Optional env vars:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `CHAIN_ID` | `1` | 1inch Fusion chain ID |
+| `RESOLVER_ADDRESS` | virtual address | Use a real deployed resolver; omit to inject bytecode via state override |
+| `RUST_LOG` | — | Log filter (e.g. `warn,backrunner=debug`) |
+
+**Run:**
+
+```sh
+TYCHO_URL=tycho-beta.propellerheads.xyz \
+TYCHO_API_KEY=your-key \
+ETH_RPC_URL=https://your-rpc \
+RUST_LOG=warn,backrunner=debug \
+cargo run --bin smoke
+```
+
+**Expected output:** The binary logs `market data ready` once the initial Tycho snapshot loads (up to ~10 minutes on first run), then `orderbook has N live Fusion orders`. After that it logs one line per block — either `no candidate`, `empty candidate`, or `candidate found` with an `eth_call` result. `swap output below auction price, skipping` log lines are normal: they mean the Dutch auction hasn't decayed to a profitable price yet.
+
 ## Read the code before you integrate
 
 - [`crates/builder-types/src/lib.rs`](crates/builder-types/src/lib.rs): every type that crosses the boundary
