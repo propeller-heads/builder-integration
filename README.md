@@ -29,7 +29,11 @@ let config = BackrunnerConfig {
     tycho_url: "app.propellerheads.xyz".to_string(),
     tycho_api_key: Some("your-api-key".to_string()),
     rpc_url: "https://your-rpc".to_string(),
-    protocols: vec!["uniswap_v3".to_string()],
+    protocols: vec![
+        "uniswap_v2", "uniswap_v3", "uniswap_v4",
+        "sushiswap_v2", "pancakeswap_v2", "pancakeswap_v3",
+        "vm:maverick_v2", "fluid_v1",
+    ].into_iter().map(str::to_owned).collect(),
     resolver_address: "0x2B658151310A7793E88E9038b927d5B25EC6915e".parse()?,
     chain_id: 1,
     min_tvl: 10.0,
@@ -44,6 +48,8 @@ let (candidate_tx, candidate_rx) = watch::channel(None::<BackrunCandidate>);
 
 tokio::spawn(backrunner.run(event_rx, candidate_tx));
 ```
+
+**Pending state.** The engine uses pending AMM state (mid-block pool state derived from transactions seen so far) when evaluating routes. Currently only Uniswap V3 supports pending state; all other protocols fall back to confirmed state. Support for additional protocols is in progress.
 
 For each block-building iteration your builder should emit:
 
