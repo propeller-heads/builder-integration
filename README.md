@@ -32,7 +32,7 @@ let config = BackrunnerConfig {
     protocols: vec![
         "uniswap_v2", "uniswap_v3", "uniswap_v4",
         "sushiswap_v2", "pancakeswap_v2", "pancakeswap_v3",
-        "curve", "fluid_v1", "ekubo_v2", "ekubo_v3",
+        "vm:curve", "fluid_v1", "ekubo_v2", "ekubo_v3",
     ].into_iter().map(str::to_owned).collect(),
     resolver_address: "0x2B658151310A7793E88E9038b927d5B25EC6915e".parse()?,
     chain_id: 1,
