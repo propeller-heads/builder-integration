@@ -1,5 +1,6 @@
 .env
 /target/
+docs/superpowers/
 .idea/
 librust_out.rlib
 libtest_expect.rlib
