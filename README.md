@@ -10,7 +10,7 @@ Two types define the integration boundary, in [`crates/builder-types/src/lib.rs`
 
 **Tycho API key.** The engine subscribes to live DEX state via [Tycho](https://propellerheads.xyz). Provision an API key at [t.me/fynd_portal_bot](https://t.me/fynd_portal_bot). Pass it as `BackrunnerConfig::tycho_api_key`.
 
-For questions about either prerequisite, reach out to [@tanay_j on Telegram](https://t.me/tanay_j).
+EOA whitelisting requires coordination with Propellerheads before your integration can go live.
 
 ## Integration modes
 
