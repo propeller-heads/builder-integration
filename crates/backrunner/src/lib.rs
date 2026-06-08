@@ -353,8 +353,7 @@ impl Backrunner {
             let Some(&fusion_order) = order_map.get(order_quote.order_id()) else { continue };
             let fill_amount = adjusted
                 .get(order_quote.order_id())
-                .map(|o| o.making_amount)
-                .unwrap_or(fusion_order.making_amount);
+                .map_or(fusion_order.making_amount, |o| o.making_amount);
 
             if let Some(backrun_tx) =
                 build_backrun_tx(&ctx, fusion_order, order_quote, fill_amount).await
@@ -646,7 +645,9 @@ async fn assemble_backrun_tx(
         ctx;
 
     let surplus_amount = amount_out.saturating_sub(taking_estimate);
-    let surplus_quote = if !surplus_amount.is_zero() {
+    let surplus_quote = if surplus_amount.is_zero() {
+        None
+    } else {
         quote_surplus_swap(
             &backrunner.solver,
             &fusion_order.to_token,
@@ -655,8 +656,6 @@ async fn assemble_backrun_tx(
             state_label.clone(),
         )
         .await
-    } else {
-        None
     };
 
     let surplus_calldata = surplus_quote
