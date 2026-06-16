@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/builder-types", "crates/backrunner", "crates/uniswap-v3-core"]
+members = [
+    "crates/builder-types",
+    "crates/backrunner",
+    "crates/uniswap-v3-core",
+    "crates/uniswap-v4-core",
+]
 resolver = "2"
 
 [workspace.package]
