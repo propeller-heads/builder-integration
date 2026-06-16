@@ -47,19 +47,11 @@ impl TxDeltaIndexer for UniswapV3Processor {
 
         for (id, comp) in &block.new_protocol_components {
             if comp.tokens.len() >= 2 {
+                let key = normalize_id(id);
                 self.pools.insert(
-                    id.clone(),
+                    key.clone(),
                     Pool {
-                        address: id
-                            .trim_start_matches("0x")
-                            .as_bytes()
-                            .chunks(2)
-                            .filter_map(|c| {
-                                std::str::from_utf8(c)
-                                    .ok()
-                                    .and_then(|s| u8::from_str_radix(s, 16).ok())
-                            })
-                            .collect(),
+                        address: hex::decode(&key).unwrap_or_default(),
                         token0: comp.tokens[0].to_vec(),
                         token1: comp.tokens[1].to_vec(),
                     },
@@ -68,26 +60,29 @@ impl TxDeltaIndexer for UniswapV3Processor {
         }
 
         for (component_id, delta) in &block.state_deltas {
-            self.apply_state_delta(component_id, delta);
+            self.apply_state_delta(&normalize_id(component_id), delta);
         }
 
         for (component_id, token_balances) in &block.component_balances {
+            let comp_key = normalize_id(component_id);
             for (token_bytes, balance) in token_balances {
                 let token_hex = hex::encode(token_bytes.as_ref());
                 let balance_val =
                     BigInt::from_bytes_be(Sign::Plus, balance.balance.as_ref());
                 self.balances
-                    .insert((component_id.clone(), token_hex), balance_val);
+                    .insert((comp_key.clone(), token_hex), balance_val);
             }
         }
 
         for id in block.deleted_protocol_components.keys() {
-            self.remove_pool(id);
+            self.remove_pool(&normalize_id(id));
         }
 
         Ok(())
     }
 
+    /// Component ids in the output use the same format the substreams packages emit
+    /// ("0x"-prefixed lower-case hex), so they match decoder state keys downstream.
     fn generate_deltas(&mut self, txs: &[TxInput]) -> BlockAggregatedChanges {
         let mut scratch = self.clone();
         let tx_changes = scratch.build_tx_changes(txs);
@@ -104,10 +99,11 @@ impl TxDeltaIndexer for UniswapV3Processor {
                 .unwrap_or_default();
 
             for ec in changes.entity_changes {
+                let component_id = emitted_id(&ec.component_id);
                 let delta = state_deltas
-                    .entry(ec.component_id.clone())
+                    .entry(component_id.clone())
                     .or_insert_with(|| ProtocolComponentStateDelta {
-                        component_id: ec.component_id.clone(),
+                        component_id: component_id.clone(),
                         updated_attributes: HashMap::new(),
                         deleted_attributes: HashSet::new(),
                     });
@@ -131,7 +127,7 @@ impl TxDeltaIndexer for UniswapV3Processor {
             }
 
             for bc in changes.balance_changes {
-                let comp_id = String::from_utf8_lossy(&bc.component_id).into_owned();
+                let comp_id = emitted_id(&hex::encode(&bc.component_id));
                 let token = Bytes::from(bc.token);
                 let balance = Bytes::from(bc.balance);
                 let balance_float = BigInt::from_bytes_be(Sign::Plus, balance.as_ref())
@@ -335,10 +331,8 @@ impl UniswapV3Processor {
             } else {
                 running.clone()
             };
-            // component_id in BalanceChange must be UTF-8 encoded component id string
-            let comp_id_bytes = pool_hex.as_bytes().to_vec();
             builder.add_balance_change(&BalanceChange {
-                component_id: comp_id_bytes,
+                component_id: event.pool_address.clone(),
                 token: delta.token.clone(),
                 balance: clamped.to_bytes_be().1,
             });
@@ -404,6 +398,18 @@ impl UniswapV3Processor {
             });
         }
     }
+}
+
+/// Canonical internal key for a component id: lower-case hex without the "0x" prefix.
+fn normalize_id(id: &str) -> String {
+    id.trim_start_matches("0x")
+        .to_lowercase()
+}
+
+/// Formats a canonical internal key into the id format the substreams packages emit
+/// ("0x"-prefixed lower-case hex).
+fn emitted_id(canonical_hex: &str) -> String {
+    format!("0x{canonical_hex}")
 }
 
 fn log_input_to_pb(
