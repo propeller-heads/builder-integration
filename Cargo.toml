@@ -4,6 +4,7 @@ members = [
     "crates/backrunner",
     "crates/uniswap-v3-core",
     "crates/uniswap-v4-core",
+    "crates/uniswap-v2-core",
 ]
 resolver = "2"
 

@@ -1,0 +1,53 @@
+[package]
+name = "uniswap-v2-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native UniswapV2 log processor implementing TxDeltaIndexer"
+
+[dependencies]
+tycho-substreams = { workspace = true }
+substreams = { workspace = true }
+substreams-ethereum = { workspace = true }
+ethabi = { workspace = true }
+tycho-common = { version = ">=0.302.0" }
+anyhow = { workspace = true }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
+hex = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["custom"] }
+
+# Workspace lints are replicated here rather than inherited via `workspace = true`
+# because the abi/ modules are generated code containing #[allow], unwrap, expect, and panic!
+# which must be permitted.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Panic prevention — relaxed for generated abi/ code
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+# No cheating — relaxed for generated abi/ code
+allow_attributes = "allow"
+# Code hygiene
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Safety
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+# Pedantic relaxations (too noisy)
+module_name_repetitions = "allow"
+similar_names = "allow"
+struct_field_names = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
