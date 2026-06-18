@@ -28,7 +28,7 @@ mod encode_test;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use alloy::primitives::{Address as AlloyAddress, I256, U256};
+use alloy::primitives::{utils::format_ether, Address as AlloyAddress, I256, U256};
 
 use abi::{build_settle_calldata, SettleParams};
 use builder_types::{BackrunCandidate, BackrunTx, BlockEnv, BuildEvent, ExecutedTx, PostState, RawTx};
@@ -44,7 +44,7 @@ use uniswap_v4_core::processor::UniswapV4Processor;
 use num_bigint::BigUint;
 use order::{amount_at_timestamp, compute_gas_bump, is_gtc_order, onchain_taking_amount, FusionOrder};
 use tokio::sync::{broadcast, mpsc, watch};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use tycho_simulation::tycho_client::feed::BlockHeader;
 use tycho_simulation::tycho_common::{
     models::{blockchain::{LogInput, TxInput}, token::Token, Address},
@@ -112,6 +112,23 @@ enum EvaluateError {
 struct PendingIteration {
     block: BlockEnv,
     txs: Vec<ExecutedTx>,
+}
+
+/// Outcome of evaluating one builder iteration, used for the per-block INFO summary.
+struct EvalOutcome {
+    /// Orders sent to the solver this iteration (0 when the iteration was skipped early).
+    orders_evaluated: usize,
+    /// Solver wall-clock time, present only when a quote actually ran.
+    solve_time_ms: Option<u64>,
+    /// The publishable candidate, if any order was profitable after gas.
+    candidate: Option<BackrunCandidate>,
+}
+
+impl EvalOutcome {
+    /// The iteration produced no candidate and ran no solve (early skip).
+    fn skipped() -> Self {
+        Self { orders_evaluated: 0, solve_time_ms: None, candidate: None }
+    }
 }
 
 /// Consumes [`BuildEvent`]s from a block builder and publishes [`BackrunCandidate`]s.
@@ -255,8 +272,11 @@ impl Backrunner {
                     warn!(%uuid, "IterationComplete for unknown iteration");
                     return;
                 };
-                let candidate = self.evaluate_backrun(uuid, iter, state).await;
-                if let Err(e) = candidates.send(candidate) {
+                let block_number = iter.block.block_number;
+                let tx_count = iter.txs.len();
+                let outcome = self.evaluate_backrun(uuid, iter, state).await;
+                log_iteration_summary(block_number, tx_count, &outcome);
+                if let Err(e) = candidates.send(outcome.candidate) {
                     error!(error = %e, "candidate watch channel has no receivers");
                 }
             }
@@ -272,7 +292,7 @@ impl Backrunner {
         uuid: Uuid,
         iter: PendingIteration,
         _state: PostState,
-    ) -> Option<BackrunCandidate> {
+    ) -> EvalOutcome {
         debug!(
             %uuid,
             block_number = iter.block.block_number,
@@ -288,7 +308,7 @@ impl Backrunner {
 
         if active.is_empty() {
             debug!(%uuid, "no active Fusion orders at block timestamp");
-            return None;
+            return EvalOutcome::skipped();
         }
 
         // Query on-chain remaining making amount for each active order (concurrent).
@@ -324,7 +344,7 @@ impl Backrunner {
 
         if adjusted.is_empty() {
             debug!(%uuid, "all active orders are fully filled on-chain");
-            return None;
+            return EvalOutcome::skipped();
         }
 
         let adjusted_refs: Vec<&FusionOrder> = adjusted.values().collect();
@@ -334,11 +354,11 @@ impl Backrunner {
                 Ok(Some(pair)) => pair,
                 Ok(None) => {
                     debug!(%uuid, "parent block not yet confirmed, skipping");
-                    return None;
+                    return EvalOutcome::skipped();
                 }
                 Err(e) => {
                     warn!(%uuid, error = %e, "evaluate_backrun failed");
-                    return None;
+                    return EvalOutcome::skipped();
                 }
             };
 
@@ -346,13 +366,16 @@ impl Backrunner {
         let order_map: HashMap<&str, &FusionOrder> =
             active.iter().map(|o| (o.order_id.as_str(), *o)).collect();
 
+        let solve_time_ms = quote.solve_time_ms();
+        let orders_evaluated = adjusted.len();
+
         let ctx = BackrunContext {
             uuid,
             block_ts,
             base_fee: iter.block.base_fee_per_gas,
             block_number: iter.block.block_number,
-            solve_time_ms: quote.solve_time_ms(),
-            orders_quoted: adjusted.len(),
+            solve_time_ms,
+            orders_quoted: orders_evaluated,
             backrunner: self,
             state_label: pending_label.clone(),
         };
@@ -375,15 +398,17 @@ impl Backrunner {
         // Always clean up the pending state label regardless of outcome.
         self.solver.market_data().remove_labeled_state(&pending_label).await;
 
-        if backrun_txs.is_empty() {
-            return None;
-        }
+        let candidate = if backrun_txs.is_empty() {
+            None
+        } else {
+            Some(BackrunCandidate {
+                uuid,
+                block_number: iter.block.block_number,
+                txs: backrun_txs,
+            })
+        };
 
-        Some(BackrunCandidate {
-            uuid,
-            block_number: iter.block.block_number,
-            txs: backrun_txs,
-        })
+        EvalOutcome { orders_evaluated, solve_time_ms: Some(solve_time_ms), candidate }
     }
 
     async fn try_evaluate(
@@ -444,6 +469,29 @@ impl Backrunner {
     }
 }
 
+/// Emits the one-line INFO summary for a completed builder iteration.
+///
+/// Prints on every iteration — including those with no opportunity — so integrators can
+/// confirm at a glance that the engine is processing builder events and see how many txs
+/// were evaluated per pending block.
+fn log_iteration_summary(block_number: u64, tx_count: usize, outcome: &EvalOutcome) {
+    let opportunities = outcome.candidate.as_ref().map_or(0, |c| c.txs.len());
+    let profit_wei = outcome.candidate.as_ref().map_or(U256::ZERO, |c| {
+        c.txs.iter().fold(U256::ZERO, |acc, tx| acc.saturating_add(tx.expected_profit_wei.unsigned_abs()))
+    });
+    let profit_eth = format_ether(profit_wei);
+    let profit_eth = profit_eth.trim_end_matches('0').trim_end_matches('.');
+    info!(
+        block = block_number,
+        txs = tx_count,
+        orders = outcome.orders_evaluated,
+        opportunities,
+        profit_eth,
+        solve_ms = outcome.solve_time_ms.unwrap_or(0),
+        "block evaluated",
+    );
+}
+
 /// Background task: polls 1inch Fusion for active orders at the configured interval.
 ///
 /// After each fetch, token decimals are patched from Tycho's registry (which has exact
@@ -474,7 +522,7 @@ async fn run_orderbook(
                     })
                     .max()
                     .unwrap_or(U256::ZERO);
-                debug!(order_count = filtered.len(), max_init_bump_bps = %max_bump, "orderbook refreshed");
+                info!(live_orders = filtered.len(), max_init_bump_bps = %max_bump, "orderbook refreshed");
                 if orders_tx.send(Arc::new(filtered)).is_err() {
                     break;
                 }
