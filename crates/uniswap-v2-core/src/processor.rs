@@ -93,22 +93,12 @@ impl TxDeltaIndexer for UniswapV2Processor {
                         updated_attributes: HashMap::new(),
                         deleted_attributes: HashSet::new(),
                     });
+                // UniswapV2 only emits `Sync` reserve updates — never attribute
+                // deletions — so every change here is an update.
                 for attr in ec.attributes {
-                    if attr.change == i32::from(ChangeType::Deletion) {
-                        delta
-                            .deleted_attributes
-                            .insert(attr.name.clone());
-                        delta
-                            .updated_attributes
-                            .remove(&attr.name);
-                    } else {
-                        delta
-                            .updated_attributes
-                            .insert(attr.name.clone(), Bytes::from(attr.value));
-                        delta
-                            .deleted_attributes
-                            .remove(&attr.name);
-                    }
+                    delta
+                        .updated_attributes
+                        .insert(attr.name, Bytes::from(attr.value));
                 }
             }
 
