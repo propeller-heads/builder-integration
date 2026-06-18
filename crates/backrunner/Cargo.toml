@@ -27,6 +27,7 @@ chrono     = { workspace = true }
 hex        = { workspace = true }
 serde_json = { workspace = true }
 futures    = { workspace = true }
+uniswap-v2-core = { path = "../uniswap-v2-core" }
 uniswap-v3-core = { path = "../uniswap-v3-core" }
 uniswap-v4-core = { path = "../uniswap-v4-core" }
 

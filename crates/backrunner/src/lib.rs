@@ -38,6 +38,7 @@ use fynd_core::{
     OrderSide, PendingBlockProcessor, PendingError, QuoteOptions, QuoteRequest, Solver, SolveError,
     SolverBuildError,
 };
+use uniswap_v2_core::processor::UniswapV2Processor;
 use uniswap_v3_core::processor::UniswapV3Processor;
 use uniswap_v4_core::processor::UniswapV4Processor;
 use num_bigint::BigUint;
@@ -138,6 +139,10 @@ impl Backrunner {
             config.rpc_url,
             config.protocols,
             config.min_tvl,
+        )
+        .with_pending_indexer(
+            "uniswap_v2",
+            Box::new(UniswapV2Processor::new(chain, "uniswap_v2".to_string())),
         )
         .with_pending_indexer(
             "uniswap_v3",
