@@ -28,6 +28,7 @@ hex        = { workspace = true }
 serde_json = { workspace = true }
 futures    = { workspace = true }
 uniswap-v3-core = { path = "../uniswap-v3-core" }
+uniswap-v4-core = { path = "../uniswap-v4-core" }
 
 [lints]
 workspace = true
