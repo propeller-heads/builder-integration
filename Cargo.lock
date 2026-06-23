@@ -3036,9 +3036,9 @@ checksum = "42012b0f064e01aa58b545fe3727f90f7dd4020f4a3ea735b50344965f5a57e9"
 
 [[package]]
 name = "fynd-core"
-version = "0.76.0"
+version = "0.81.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57e8239ce4b35e9c0a9c461623f77b35c5b062ef3b74ce17f54ac73f2eb2d2ed"
+checksum = "17e2258f0c5ee75bc1151340b7dde1a7cdf7dc7df543c361ea139699e889f2ae"
 dependencies = [
  "alloy",
  "async-channel",
