@@ -63,6 +63,11 @@ pub struct BackrunCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackrunTx {
     pub tx: RawTx,
+    /// Expected surplus captured by the resolver, denominated in WETH (ETH wei).
+    ///
+    /// When the order's taker asset is WETH this is the raw surplus; otherwise it is
+    /// the WETH output of the surplus→WETH swap, so the value is comparable across
+    /// orders regardless of taker asset.
     pub expected_profit_wei: I256,
     pub expected_gas: u64,
 }
