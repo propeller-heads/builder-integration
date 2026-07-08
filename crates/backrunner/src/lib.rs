@@ -52,6 +52,10 @@ use tycho_simulation::tycho_common::{
 };
 use uuid::Uuid;
 
+/// Canonical WETH address on Ethereum mainnet. Surplus is unwrapped/held directly when
+/// the taker asset is WETH; otherwise it is swapped to WETH so profit is ETH-denominated.
+const WETH_HEX: &str = "0xC02aAA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+
 /// Configuration for a [`Backrunner`] instance.
 #[derive(Debug, Clone)]
 pub struct BackrunnerConfig {
@@ -703,7 +707,8 @@ async fn assemble_backrun_tx(
         ctx;
 
     let surplus_amount = amount_out.saturating_sub(taking_estimate);
-    let surplus_quote = if surplus_amount.is_zero() {
+    let taker_is_weth = fusion_order.to_token.eq_ignore_ascii_case(WETH_HEX);
+    let surplus_quote = if surplus_amount.is_zero() || taker_is_weth {
         None
     } else {
         quote_surplus_swap(
@@ -767,12 +772,21 @@ async fn assemble_backrun_tx(
         max_priority_fee_per_gas: 100_000_000,
     };
 
-    let expected_profit = I256::try_from(surplus_amount).unwrap_or(I256::MAX);
+    // Profit is always WETH-denominated (ETH wei): the surplus is already WETH when the
+    // taker asset is WETH, otherwise it is the WETH output of the surplus→WETH swap. This
+    // keeps expected_profit_wei comparable across orders with different taker assets.
+    let profit_weth = if taker_is_weth {
+        surplus_amount
+    } else {
+        surplus_quote.as_ref().map_or(U256::ZERO, |q| biguint_to_u256(q.amount_out()))
+    };
+    let expected_profit = I256::try_from(profit_weth).unwrap_or(I256::MAX);
 
     debug!(%uuid, block_number, solve_time_ms, orders_quoted,
         amount_out = %amount_out,
         taking_estimate = %taking_estimate,
         surplus = %surplus_amount,
+        profit_weth = %profit_weth,
         "backrun candidate built");
 
     Some(BackrunTx { tx: raw_tx, expected_profit_wei: expected_profit, expected_gas: 300_000 })
@@ -789,7 +803,6 @@ async fn quote_surplus_swap(
     resolver_address: AlloyAddress,
     state_label: fynd_core::StateLabel,
 ) -> Option<OrderQuote> {
-    const WETH_HEX: &str = "0xC02aAA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
     if token_in_hex.eq_ignore_ascii_case(WETH_HEX) {
         return None; // surplus WETH unwrapped directly — no swap needed
     }
