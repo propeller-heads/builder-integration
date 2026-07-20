@@ -24,6 +24,7 @@ pub struct AuctionPoint {
 /// A live 1inch Fusion limit order with its Dutch auction parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FusionOrder {
+    /// 1inch order hash (`0x`-prefixed hex) uniquely identifying this order.
     pub order_id: String,
     /// Maker asset address (0x-prefixed hex, lowercase).
     pub from_token: String,
@@ -41,9 +42,13 @@ pub struct FusionOrder {
     pub auction_start_time: u64,
     /// Piecewise-linear decay curve breakpoints (may be empty).
     pub points: Vec<AuctionPoint>,
+    /// Human-readable symbol for `from_token`, as reported by the Fusion API (may be absent).
     pub from_token_symbol: Option<String>,
+    /// Human-readable symbol for `to_token`, as reported by the Fusion API (may be absent).
     pub to_token_symbol: Option<String>,
+    /// Decimals of `from_token`. Falls back to a hardcoded table, then 18, if the API omits it.
     pub from_token_decimals: u8,
+    /// Decimals of `to_token`. Falls back to a hardcoded table, then 18, if the API omits it.
     pub to_token_decimals: u8,
     /// USD value of one whole `from_token` at order creation.
     pub from_token_usd_rate: f64,
