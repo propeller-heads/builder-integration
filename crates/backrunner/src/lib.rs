@@ -26,6 +26,8 @@ mod order;
 #[cfg(test)]
 mod encode_test;
 
+pub use order::{AuctionPoint, FusionOrder};
+
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use alloy::primitives::{utils::format_ether, Address as AlloyAddress, I256, U256};
@@ -42,7 +44,7 @@ use uniswap_v2_core::processor::UniswapV2Processor;
 use uniswap_v3_core::processor::UniswapV3Processor;
 use uniswap_v4_core::processor::UniswapV4Processor;
 use num_bigint::BigUint;
-use order::{amount_at_timestamp, compute_gas_bump, is_gtc_order, onchain_taking_amount, FusionOrder};
+use order::{amount_at_timestamp, compute_gas_bump, is_gtc_order, onchain_taking_amount};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 use tycho_simulation::tycho_client::feed::BlockHeader;
@@ -305,11 +307,11 @@ impl Backrunner {
         }
     }
 
-    async fn evaluate_backrun(
+    async fn evaluate_orders(
         &self,
         uuid: Uuid,
         iter: PendingIteration,
-        _state: PostState,
+        orders: &[FusionOrder],
     ) -> EvalOutcome {
         debug!(
             %uuid,
@@ -318,7 +320,6 @@ impl Backrunner {
             "evaluating backrun opportunity",
         );
 
-        let orders = self.orders_rx.borrow().clone();
         let block_ts = iter.block.block_timestamp;
 
         let active: Vec<&FusionOrder> =
@@ -427,6 +428,35 @@ impl Backrunner {
         };
 
         EvalOutcome { orders_evaluated, solve_time_ms: Some(solve_time_ms), candidate }
+    }
+
+    async fn evaluate_backrun(
+        &self,
+        uuid: Uuid,
+        iter: PendingIteration,
+        _state: PostState,
+    ) -> EvalOutcome {
+        let orders = self.orders_rx.borrow().clone();
+        self.evaluate_orders(uuid, iter, &orders).await
+    }
+
+    /// Solves the given Fusion orders against confirmed state overlaid with the
+    /// executed transactions of one in-progress block build.
+    ///
+    /// This is the direct-intent entry point: unlike [`Backrunner::run`], which
+    /// evaluates the internally polled orderbook at `IterationComplete`, this
+    /// solves exactly the orders passed in, immediately. Returns a candidate if
+    /// at least one order is profitably fillable after gas.
+    pub async fn solve_orders(
+        &self,
+        uuid: Uuid,
+        block: BlockEnv,
+        txs: Vec<ExecutedTx>,
+        orders: &[FusionOrder],
+    ) -> Option<BackrunCandidate> {
+        self.evaluate_orders(uuid, PendingIteration { block, txs }, orders)
+            .await
+            .candidate
     }
 
     async fn try_evaluate(
