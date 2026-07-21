@@ -26,6 +26,8 @@ mod order;
 #[cfg(test)]
 mod encode_test;
 
+pub use order::{AuctionPoint, FusionOrder};
+
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use alloy::primitives::{utils::format_ether, Address as AlloyAddress, I256, U256};
@@ -42,7 +44,7 @@ use uniswap_v2_core::processor::UniswapV2Processor;
 use uniswap_v3_core::processor::UniswapV3Processor;
 use uniswap_v4_core::processor::UniswapV4Processor;
 use num_bigint::BigUint;
-use order::{amount_at_timestamp, compute_gas_bump, is_gtc_order, onchain_taking_amount, FusionOrder};
+use order::{amount_at_timestamp, compute_gas_bump, is_gtc_order, onchain_taking_amount};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 use tycho_simulation::tycho_client::feed::BlockHeader;
@@ -52,14 +54,23 @@ use tycho_simulation::tycho_common::{
 };
 use uuid::Uuid;
 
-/// Canonical WETH address on Ethereum mainnet. Surplus is unwrapped/held directly when
-/// the taker asset is WETH; otherwise it is swapped to WETH so profit is ETH-denominated.
-const WETH_HEX: &str = "0xC02aAA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+/// Canonical wrapped-native-token address per chain slug. Surplus is unwrapped/held
+/// directly when the taker asset is WETH; otherwise it is swapped to WETH so profit
+/// is ETH-denominated. `None` for chains without a known WETH deployment.
+fn weth_hex_for_chain(chain: &str) -> Option<&'static str> {
+    match chain {
+        "ethereum" => Some("0xC02aAA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
+        "base" | "unichain" => Some("0x4200000000000000000000000000000000000006"),
+        "arbitrum" => Some("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"),
+        _ => None,
+    }
+}
 
 /// Configuration for a [`Backrunner`] instance.
 #[derive(Debug, Clone)]
 pub struct BackrunnerConfig {
-    /// Chain slug: `"ethereum"`, `"base"`, `"arbitrum"`, `"bsc"`, `"zksync"`, `"unichain"`.
+    /// Chain slug: `"ethereum"`, `"base"`, `"arbitrum"`, or `"unichain"`. Other chains have
+    /// no known WETH mapping and are rejected at build time.
     pub chain: String,
     /// Tycho WebSocket host (e.g. `"app.propellerheads.xyz"`).
     pub tycho_url: String,
@@ -145,12 +156,16 @@ pub struct Backrunner {
     pub(crate) slippage: f64,
     oneinch: Arc<OneinchClient>,
     verify_onchain_taking: bool,
+    /// WETH address (0x-hex) for the configured chain; profit denomination + surplus swaps.
+    weth_hex: &'static str,
 }
 
 impl Backrunner {
     /// Builds a [`Backrunner`] and waits for the market-data snapshot to arrive.
     pub async fn build(config: BackrunnerConfig) -> Result<Self, BuildError> {
         let chain = parse_chain(&config.chain)?;
+        let weth_hex = weth_hex_for_chain(&config.chain)
+            .ok_or_else(|| BuildError::UnsupportedChain(config.chain.clone()))?;
 
         let oneinch = Arc::new(OneinchClient::new(config.chain_id, config.rpc_url.clone())?);
 
@@ -206,6 +221,7 @@ impl Backrunner {
             slippage: config.slippage,
             oneinch,
             verify_onchain_taking: config.verify_onchain_taking,
+            weth_hex,
         })
     }
 
@@ -291,11 +307,11 @@ impl Backrunner {
         }
     }
 
-    async fn evaluate_backrun(
+    async fn evaluate_orders(
         &self,
         uuid: Uuid,
         iter: PendingIteration,
-        _state: PostState,
+        orders: &[FusionOrder],
     ) -> EvalOutcome {
         debug!(
             %uuid,
@@ -304,7 +320,6 @@ impl Backrunner {
             "evaluating backrun opportunity",
         );
 
-        let orders = self.orders_rx.borrow().clone();
         let block_ts = iter.block.block_timestamp;
 
         let active: Vec<&FusionOrder> =
@@ -413,6 +428,35 @@ impl Backrunner {
         };
 
         EvalOutcome { orders_evaluated, solve_time_ms: Some(solve_time_ms), candidate }
+    }
+
+    async fn evaluate_backrun(
+        &self,
+        uuid: Uuid,
+        iter: PendingIteration,
+        _state: PostState,
+    ) -> EvalOutcome {
+        let orders = self.orders_rx.borrow().clone();
+        self.evaluate_orders(uuid, iter, &orders).await
+    }
+
+    /// Solves the given Fusion orders against confirmed state overlaid with the
+    /// executed transactions of one in-progress block build.
+    ///
+    /// This is the direct-intent entry point: unlike [`Backrunner::run`], which
+    /// evaluates the internally polled orderbook at `IterationComplete`, this
+    /// solves exactly the orders passed in, immediately. Returns a candidate if
+    /// at least one order is profitably fillable after gas.
+    pub async fn solve_orders(
+        &self,
+        uuid: Uuid,
+        block: BlockEnv,
+        txs: Vec<ExecutedTx>,
+        orders: &[FusionOrder],
+    ) -> Option<BackrunCandidate> {
+        self.evaluate_orders(uuid, PendingIteration { block, txs }, orders)
+            .await
+            .candidate
     }
 
     async fn try_evaluate(
@@ -707,7 +751,7 @@ async fn assemble_backrun_tx(
         ctx;
 
     let surplus_amount = amount_out.saturating_sub(taking_estimate);
-    let taker_is_weth = fusion_order.to_token.eq_ignore_ascii_case(WETH_HEX);
+    let taker_is_weth = fusion_order.to_token.eq_ignore_ascii_case(backrunner.weth_hex);
     let surplus_quote = if surplus_amount.is_zero() || taker_is_weth {
         None
     } else {
@@ -717,6 +761,7 @@ async fn assemble_backrun_tx(
             surplus_amount,
             backrunner.resolver_address,
             state_label.clone(),
+            backrunner.weth_hex,
         )
         .await
     };
@@ -802,12 +847,13 @@ async fn quote_surplus_swap(
     surplus_amount: U256,
     resolver_address: AlloyAddress,
     state_label: fynd_core::StateLabel,
+    weth_hex: &str,
 ) -> Option<OrderQuote> {
-    if token_in_hex.eq_ignore_ascii_case(WETH_HEX) {
+    if token_in_hex.eq_ignore_ascii_case(weth_hex) {
         return None; // surplus WETH unwrapped directly — no swap needed
     }
     let from_bytes = parse_address(token_in_hex).ok()?;
-    let to_bytes = parse_address(WETH_HEX).ok()?;
+    let to_bytes = parse_address(weth_hex).ok()?;
     let sender = TychoBytes::from(resolver_address.as_slice().to_vec());
     let amount = {
         let bytes = surplus_amount.to_be_bytes::<32>();
@@ -911,4 +957,22 @@ pub(crate) fn parse_address(hex_str: &str) -> anyhow::Result<TychoBytes> {
         .map_err(|e| anyhow::anyhow!("hex-decode failed for {hex_str}: {e}"))?;
     anyhow::ensure!(raw.len() == 20, "expected 20 bytes, got {}: {hex_str}", raw.len());
     Ok(TychoBytes::from(raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weth_hex_matches_chain() {
+        assert_eq!(
+            weth_hex_for_chain("ethereum"),
+            Some("0xC02aAA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
+        );
+        assert_eq!(
+            weth_hex_for_chain("base"),
+            Some("0x4200000000000000000000000000000000000006")
+        );
+        assert_eq!(weth_hex_for_chain("starknet"), None);
+    }
 }
