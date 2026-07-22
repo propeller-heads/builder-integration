@@ -130,7 +130,14 @@ pub enum MakerSigCheck {
     },
     /// The signature cannot be verified offchain: it is not a 65-byte `r||s||v` EOA
     /// signature (most likely an ERC-1271 contract-maker signature), or the order's
-    /// fields could not be parsed. Callers should defer to on-chain validation.
+    /// fields could not be parsed.
+    ///
+    /// This is NOT a rejection signal — it means "no offchain opinion either way", not
+    /// "this order is invalid". Callers MUST treat this the same as skipping the offchain
+    /// check entirely and defer to on-chain validation (e.g. `isValidSignature`/`ecrecover`
+    /// inside `fillContractOrderArgs`/`fillOrderArgs`), NOT reject the order. Only
+    /// [`MakerSigCheck::Mismatch`] is a hard reject; [`MakerSigCheck::Unsupported`] just means
+    /// this particular check has nothing to say.
     Unsupported,
 }
 
