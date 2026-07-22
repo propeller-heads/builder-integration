@@ -12,7 +12,7 @@ description = "Block-builder backrun engine: embeddable lib or standalone proces
 builder-types = { workspace = true }
 fynd-core = { workspace = true }
 tycho-simulation = { workspace = true }
-alloy = { workspace = true }
+alloy = { workspace = true, features = ["k256"] }
 tokio = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }

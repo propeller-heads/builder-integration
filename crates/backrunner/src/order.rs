@@ -1,5 +1,9 @@
-use alloy::primitives::U256;
+use std::str::FromStr;
+
+use alloy::primitives::{keccak256, Address, Signature, B256, U256};
 use serde::{Deserialize, Serialize};
+
+use crate::client::{address_to_u256, hex_to_bytes, LOP_V4};
 
 /// Divisor for rate bumps stored in auction points and `init_rate_bump` (1e7 = 100%).
 const RATE_BUMP_DIVISOR: u128 = 10_000_000;
@@ -94,6 +98,146 @@ pub fn is_gtc_order(order: &FusionOrder) -> bool {
     const GTC_DURATION_THRESHOLD_SECS: u64 = 3_600;
     order.auction_start_amount <= order.auction_end_amount
         && order.auction_duration_secs > GTC_DURATION_THRESHOLD_SECS
+}
+
+/// EIP-712 domain name for the deployed LOP v4 contract.
+///
+/// NOT "1inch Limit Order Protocol" — the contract's constructor-set EIP-712 domain was
+/// verified live via `eip712Domain()` (EIP-5267) on the deployed contract
+/// (0x111111125421cA6dc452d289314280a0f8842A65, chain 1): it returns name
+/// `"1inch Aggregation Router"`, version `"6"`. 1inch's source on GitHub still shows
+/// `EIP712("1inch Limit Order Protocol", "4")`, but that does not match what is actually
+/// deployed at this address today.
+const LOP_DOMAIN_NAME: &str = "1inch Aggregation Router";
+/// EIP-712 domain version for the deployed LOP v4 contract. See [`LOP_DOMAIN_NAME`].
+const LOP_DOMAIN_VERSION: &str = "6";
+/// EIP-712 `Order` struct type string, exactly matching the deployed LOP v4 layout
+/// (all address fields typed as `address`, NOT the packed `uint256` used by [`crate::abi`]'s
+/// `IOrderMixin::Order` — that layout yields a different typehash and would silently reject
+/// every real order).
+const ORDER_TYPE_STRING: &[u8] = b"Order(uint256 salt,address maker,address receiver,address \
+makerAsset,address takerAsset,uint256 makingAmount,uint256 takingAmount,uint256 makerTraits)";
+
+/// Result of independently verifying a [`FusionOrder`]'s maker signature offchain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MakerSigCheck {
+    /// The signature recovers to `maker_address`.
+    Verified,
+    /// The signature is well-formed but recovers to a different address than `maker_address`.
+    Mismatch {
+        /// The address recovered from the signature over the order digest.
+        recovered: Address,
+    },
+    /// The signature cannot be verified offchain: it is not a 65-byte `r||s||v` EOA
+    /// signature (most likely an ERC-1271 contract-maker signature), or the order's
+    /// fields could not be parsed. Callers should defer to on-chain validation.
+    Unsupported,
+}
+
+impl FusionOrder {
+    /// Computes the LOP v4 EIP-712 order digest: `keccak256(0x1901 ++ domainSeparator ++
+    /// hashStruct(order))`.
+    ///
+    /// This is the exact value the 1inch API reports as `order_hash`, and the value
+    /// `ecrecover`/`isValidSignature` is checked against on-chain. Reused to
+    /// independently authenticate a Fusion order's maker signature offchain.
+    pub fn order_digest(&self, chain_id: u64) -> anyhow::Result<B256> {
+        let domain_separator = lop_domain_separator(chain_id);
+        let struct_hash = self.order_struct_hash()?;
+
+        let mut preimage = Vec::with_capacity(2 + 32 + 32);
+        preimage.extend_from_slice(&[0x19, 0x01]);
+        preimage.extend_from_slice(domain_separator.as_slice());
+        preimage.extend_from_slice(struct_hash.as_slice());
+        Ok(keccak256(&preimage))
+    }
+
+    /// `hashStruct(order) = keccak256(ORDER_TYPEHASH ++ 8×32-byte field words)`.
+    fn order_struct_hash(&self) -> anyhow::Result<B256> {
+        let salt = U256::from_str(&self.salt)
+            .map_err(|e| anyhow::anyhow!("invalid order salt {:?}: {e}", self.salt))?;
+        let maker_traits = U256::from_str(&self.maker_traits)
+            .map_err(|e| anyhow::anyhow!("invalid maker_traits {:?}: {e}", self.maker_traits))?;
+        let maker = address_to_u256(&self.maker_address)?;
+        let receiver = address_to_u256(&self.receiver_address)?;
+        let maker_asset = address_to_u256(&self.from_token)?;
+        let taker_asset = address_to_u256(&self.to_token)?;
+
+        let fields = [
+            salt,
+            maker,
+            receiver,
+            maker_asset,
+            taker_asset,
+            self.making_amount,
+            self.auction_end_amount, // LOP takingAmount == our Dutch-auction floor
+            maker_traits,
+        ];
+
+        let mut preimage = Vec::with_capacity(32 * (1 + fields.len()));
+        preimage.extend_from_slice(keccak256(ORDER_TYPE_STRING).as_slice());
+        for field in fields {
+            preimage.extend_from_slice(&field.to_be_bytes::<32>());
+        }
+        Ok(keccak256(&preimage))
+    }
+
+    /// Independently verifies the maker's EIP-712 signature over this order.
+    ///
+    /// Only 65-byte `r||s||v` EOA signatures can be checked offchain (`v` accepted in
+    /// either `{27,28}` or `{0,1}` form). Non-65-byte signatures — almost always an
+    /// ERC-1271 contract-maker signature — return [`MakerSigCheck::Unsupported`];
+    /// callers should defer to on-chain `isValidSignature` validation for those.
+    #[must_use]
+    pub fn verify_maker_signature(&self, chain_id: u64) -> MakerSigCheck {
+        let Ok(sig_bytes) = hex_to_bytes(&self.signature) else {
+            return MakerSigCheck::Unsupported;
+        };
+        if sig_bytes.len() != 65 {
+            return MakerSigCheck::Unsupported;
+        }
+        let Ok(digest) = self.order_digest(chain_id) else {
+            return MakerSigCheck::Unsupported;
+        };
+        let Ok(signature) = Signature::from_raw(&sig_bytes) else {
+            return MakerSigCheck::Unsupported;
+        };
+        let Ok(recovered) = signature.recover_address_from_prehash(&digest) else {
+            return MakerSigCheck::Unsupported;
+        };
+        let Ok(maker) = Address::from_str(&self.maker_address) else {
+            return MakerSigCheck::Unsupported;
+        };
+        if recovered == maker {
+            MakerSigCheck::Verified
+        } else {
+            MakerSigCheck::Mismatch { recovered }
+        }
+    }
+}
+
+/// Computes the EIP-712 domain separator for the LOP v4 contract on `chain_id`.
+fn lop_domain_separator(chain_id: u64) -> B256 {
+    let domain_typehash = keccak256(
+        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    );
+    let name_hash = keccak256(LOP_DOMAIN_NAME.as_bytes());
+    let version_hash = keccak256(LOP_DOMAIN_VERSION.as_bytes());
+
+    let mut preimage = Vec::with_capacity(32 * 5);
+    preimage.extend_from_slice(domain_typehash.as_slice());
+    preimage.extend_from_slice(name_hash.as_slice());
+    preimage.extend_from_slice(version_hash.as_slice());
+    preimage.extend_from_slice(&U256::from(chain_id).to_be_bytes::<32>());
+    preimage.extend_from_slice(&address_word(LOP_V4));
+    keccak256(&preimage)
+}
+
+/// Left-pads an address into its 32-byte EIP-712 ABI word.
+fn address_word(address: Address) -> [u8; 32] {
+    let mut word = [0u8; 32];
+    word[12..].copy_from_slice(address.as_slice());
+    word
 }
 
 /// Computes the exact on-chain taking amount matching `SimpleSettlement.getTakingAmount`:
@@ -696,5 +840,154 @@ mod tests {
     #[test]
     fn dca_expired_returns_none() {
         assert_eq!(onchain_taking_amount(&dca_order(), 1_780_417_052 + 180, 2_310_734_453), None);
+    }
+
+    // ── EIP-712 order digest & maker-signature verification ───────────────────────────
+    //
+    // Ground truth: the real WETH→USDT order from `encode_test.rs`, filled on mainnet at
+    // block 25222660 by tx 0x95fe1ab933411f472d0e7cb0d38f60ccf223ceb514989f7d2cad1da61b7a81dd
+    // (`settleOrders` → `fillContractOrderArgs`). Fetched live and cross-checked against this
+    // repo's fixture: every field (salt, maker, receiver, assets, amounts, makerTraits,
+    // 256-byte ERC-1271 signature) decodes byte-for-byte identically to `encode_test.rs`'s
+    // `SIGNATURE_HEX`/`RawOrderFields`.
+    //
+    // Two corrections this uncovered, relative to the original task brief:
+    // 1. `0xddc5239bef2a...` — labelled `order_id`/`order_hash` in this repo's existing
+    //    fixtures (`encode_test.rs`, `usdt_order()` above) — is actually this order's
+    //    **salt**, not its order hash. (It does satisfy the LOP `isValidExtension` low-160-bit
+    //    extension-hash binding, which is what made this look plausible.) The genuine order
+    //    hash, confirmed via the real `OrderFilled(bytes32 orderHash, uint256 remainingAmount)`
+    //    log in that transaction's receipt, is
+    //    `0x1de5a862905f24eb617987b00c9889b4b87244a0a867b4ba17877f4b0eada6b6`.
+    // 2. The deployed contract's EIP-712 domain is NOT `("1inch Limit Order Protocol", "4")`
+    //    as 1inch's current GitHub source suggests — a live `eip712Domain()` (EIP-5267) call
+    //    to 0x111111125421cA6dc452d289314280a0f8842A65 on chain 1 returns
+    //    `("1inch Aggregation Router", "6")`. See [`LOP_DOMAIN_NAME`].
+    //
+    // This order's maker (0xc7ae508d...) is an ERC-1271 smart-contract wallet — its
+    // signature is 256 bytes (see `encode_test.rs`, and `abi.rs`'s choice of
+    // `fillContractOrderArgs` for non-65-byte signatures). So `verify_maker_signature`
+    // on this exact real order must return `Unsupported`, never `Verified`. There is no
+    // real EOA-signed 1inch order fixture anywhere in this repo, so the EOA recovery
+    // path is exercised with a synthetic signature (Anvil/Foundry's well-known default
+    // test key #0) over this same real, ground-truthed digest.
+
+    /// Real ERC-1271 WETH→USDT order, filled at block 25222660 (see module-level comment
+    /// above for the transaction that filled it and how the fields were cross-checked).
+    fn real_erc1271_usdt_order() -> FusionOrder {
+        FusionOrder {
+            order_id: "0x1de5a862905f24eb617987b00c9889b4b87244a0a867b4ba17877f4b0eada6b6".into(),
+            from_token: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),
+            to_token:   "0xdac17f958d2ee523a2206206994597c13d831ec7".into(),
+            making_amount:        U256::from(671_300_000_000_000_000u128),
+            auction_start_amount: U256::from(1_334_973_822u64),
+            auction_end_amount:   U256::from(1_327_889_927u64), // LOP takingAmount / floor
+            auction_duration_secs: 180,
+            auction_start_time:    1_780_318_371,
+            points: vec![],
+            from_token_symbol: Some("WETH".into()),
+            to_token_symbol:   Some("USDT".into()),
+            from_token_decimals: 18,
+            to_token_decimals:    6,
+            from_token_usd_rate: 0.0,
+            to_token_usd_rate:   0.0,
+            gas_bump_estimate:       3_080,
+            gas_price_estimate_mwei:   336,
+            init_rate_bump: 0,
+            total_fees_1e5: 0,
+            // Real 256-byte ERC-1271 signature (concat of encode_test.rs::SIGNATURE_HEX).
+            signature: concat!(
+                "0x",
+                "ddc5239bef2a6f7afc8967384e209ec5548215abda64e5a68e89e7e0741f2090",
+                "000000000000000000000000d27cc478689bea4dafe2ab7e486944d775e539a3",
+                "000000000000000000000000399740157391a9f1bf4e9921a8834f9bc8f2678e",
+                "000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                "000000000000000000000000dac17f958d2ee523a2206206994597c13d831ec7",
+                "0000000000000000000000000000000000000000000000000950efcb15b84000",
+                "000000000000000000000000000000000000000000000000000000004f25fe07",
+                "8a00000000000000000000001254000016006a1d816300000000000000000000",
+            )
+            .into(),
+            extension: "0x".into(),
+            // Decimal(0xddc5239bef2a6f7afc8967384e209ec5548215abda64e5a68e89e7e0741f2090)
+            salt: "100309454173764179270272824781866126838468984213009708139965346861068851290256"
+                .into(),
+            maker_address:    "0xc7ae508ddc86d6acfeb80c3f0e972d1a22bacaad".into(),
+            receiver_address: "0x399740157391a9f1bf4e9921a8834f9bc8f2678e".into(),
+            // Decimal(0x8a00000000000000000000001254000016006a1d816300000000000000000000)
+            maker_traits: "62419173104490761595518734106350460423654101960782298241773079837553102684160"
+                .into(),
+        }
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test assertion helper")]
+    fn order_digest_matches_real_order_hash() {
+        let order = real_erc1271_usdt_order();
+        let expected: B256 = "0x1de5a862905f24eb617987b00c9889b4b87244a0a867b4ba17877f4b0eada6b6"
+            .parse()
+            .expect("valid B256 literal");
+        assert_eq!(
+            order.order_digest(1).expect("well-formed order fields"),
+            expected
+        );
+    }
+
+    #[test]
+    fn verify_maker_signature_unsupported_for_erc1271_order() {
+        // Real fixture's signature is 256 bytes (ERC-1271 contract maker) — cannot be
+        // ecrecover-verified offchain, regardless of how the digest checks out.
+        let order = real_erc1271_usdt_order();
+        assert_eq!(order.verify_maker_signature(1), MakerSigCheck::Unsupported);
+    }
+
+    /// Builds a copy of the real order with `maker_address` replaced by Anvil/Foundry's
+    /// well-known default test account #0, and a fresh 65-byte EOA signature over the
+    /// resulting (maker-consistent) digest — `maker_address` MUST be set before the
+    /// digest is computed, since `maker` is itself part of the struct hash.
+    #[expect(clippy::expect_used, reason = "test fixture helper")]
+    fn synthetic_eoa_order() -> FusionOrder {
+        use alloy::signers::local::PrivateKeySigner;
+        use alloy::signers::SignerSync;
+
+        let signer: PrivateKeySigner =
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                .parse()
+                .expect("valid test private key");
+
+        let mut order = real_erc1271_usdt_order();
+        order.maker_address = format!("{:#x}", signer.address());
+
+        let digest = order.order_digest(1).expect("well-formed order fields");
+        let signature = signer
+            .sign_hash_sync(&digest)
+            .expect("signing a 32-byte digest cannot fail");
+        order.signature = format!("0x{}", hex::encode(signature.as_bytes()));
+        order
+    }
+
+    #[test]
+    fn verify_maker_signature_verified_for_synthetic_eoa_order() {
+        // Same real, ground-truthed order fields, but with a synthetic 65-byte EOA
+        // signature over the same digest mechanism validated in
+        // `order_digest_matches_real_order_hash`, and `maker_address` set to that
+        // signer — proving the ecrecover path end to end.
+        let order = synthetic_eoa_order();
+        assert_eq!(order.verify_maker_signature(1), MakerSigCheck::Verified);
+    }
+
+    #[test]
+    fn verify_maker_signature_mismatch_when_amount_tampered() {
+        let mut order = synthetic_eoa_order();
+        let maker = order.maker_address.clone();
+
+        // Tamper a field AFTER signing: the signature was computed over the original
+        // digest, so the recomputed digest (and recovered signer) now differ.
+        order.making_amount += U256::from(1u64);
+
+        let MakerSigCheck::Mismatch { recovered } = order.verify_maker_signature(1) else {
+            unreachable!("tampering the making_amount must change the digest and thus the check");
+        };
+        assert_ne!(format!("{recovered:#x}"), maker.to_lowercase());
     }
 }
