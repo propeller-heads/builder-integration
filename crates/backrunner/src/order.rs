@@ -108,6 +108,12 @@ pub fn is_gtc_order(order: &FusionOrder) -> bool {
 /// `"1inch Aggregation Router"`, version `"6"`. 1inch's source on GitHub still shows
 /// `EIP712("1inch Limit Order Protocol", "4")`, but that does not match what is actually
 /// deployed at this address today.
+///
+/// Cross-chain validation: the same live `eip712Domain()` call was also made against
+/// this address on Base (chain 8453) and returned an IDENTICAL name (`"1inch Aggregation
+/// Router"`), version (`"6"`), and `verifyingContract`. `chainId` is the only domain field
+/// that varies per chain, and [`lop_domain_separator`] already takes it as a parameter —
+/// so this cross-chain correctness is a validated fact, not an inferred assumption.
 const LOP_DOMAIN_NAME: &str = "1inch Aggregation Router";
 /// EIP-712 domain version for the deployed LOP v4 contract. See [`LOP_DOMAIN_NAME`].
 const LOP_DOMAIN_VERSION: &str = "6";
@@ -996,5 +1002,17 @@ mod tests {
             unreachable!("tampering the making_amount must change the digest and thus the check");
         };
         assert_ne!(format!("{recovered:#x}"), maker.to_lowercase());
+    }
+
+    #[test]
+    fn verify_maker_signature_unsupported_for_malformed_maker_address() {
+        // A well-formed 65-byte signature, but a maker_address that isn't valid hex.
+        // This must fail inside `order_digest` (via `order_struct_hash`'s
+        // `address_to_u256`), hitting the `let Ok(digest) = ... else { return Unsupported }`
+        // branch — distinct from the earlier signature-length guard, which the
+        // ERC-1271 test above already covers.
+        let mut order = synthetic_eoa_order();
+        order.maker_address = "0xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_string();
+        assert_eq!(order.verify_maker_signature(1), MakerSigCheck::Unsupported);
     }
 }

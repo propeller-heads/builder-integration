@@ -14,7 +14,8 @@ use crate::abi::RawOrderFields;
 use crate::order::{AuctionPoint, FusionOrder};
 use crate::parse_address;
 
-/// 1inch LOP v4 on Ethereum mainnet.
+/// 1inch LOP v4. Same deterministic address across chains (Ethereum, Base, etc.) — not
+/// Ethereum-mainnet-only.
 pub(crate) const LOP_V4: AlloyAddress =
     alloy::primitives::address!("111111125421cA6dc452d289314280a0f8842A65");
 
