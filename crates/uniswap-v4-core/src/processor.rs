@@ -113,6 +113,7 @@ impl TxDeltaIndexer for UniswapV4Processor {
                         component_id: component_id.clone(),
                         updated_attributes: HashMap::new(),
                         deleted_attributes: HashSet::new(),
+                        created_attributes: HashSet::new(),
                     });
                 for attr in ec.attributes {
                     if attr.change == i32::from(ChangeType::Deletion) {

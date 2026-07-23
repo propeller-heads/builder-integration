@@ -92,6 +92,7 @@ impl TxDeltaIndexer for UniswapV2Processor {
                         component_id: component_id.clone(),
                         updated_attributes: HashMap::new(),
                         deleted_attributes: HashSet::new(),
+                        created_attributes: HashSet::new(),
                     });
                 // UniswapV2 only emits `Sync` reserve updates — never attribute
                 // deletions — so every change here is an update.
