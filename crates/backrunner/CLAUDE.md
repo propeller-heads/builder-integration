@@ -149,5 +149,10 @@ and verified against `query_onchain_taking_amount` ground truth.
 - **GTC orders filtered**: `is_gtc_order` drops orders with `start_amount <= end_amount` and
   `duration > 1h`. These are limit orders with no auction premium and no backrun opportunity.
 
-- **Partial fills**: `query_remaining_making_amount` reads `LOP.remainingInvalidatorForOrder`
-  to detect partial fills before quoting Fynd. Fresh orders return `U256::MAX` (never touched).
+- **Partial fills / dead orders**: `query_remaining_making_amount` dispatches on
+  `makerTraits` to the invalidation mechanism the LOP uses for the order. Partial-fillable
+  orders: `remainingInvalidatorForOrder` (fresh orders revert `RemainingInvalidatedOrder()`
+  — treated as full; fully filled/cancelled return 0). All-or-nothing orders (partial or
+  multiple fills disallowed): `bitInvalidatorForOrder(maker, nonce)` — the nonce's bit set
+  in the returned bitmap means filled/cancelled. Note the LOP takes the raw nonce despite
+  the ABI naming the parameter `slot`.
