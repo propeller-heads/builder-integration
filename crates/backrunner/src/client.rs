@@ -19,9 +19,34 @@ pub(crate) const LOP_V4: AlloyAddress =
     alloy::primitives::address!("111111125421cA6dc452d289314280a0f8842A65");
 
 /// `remainingInvalidatorForOrder(address,bytes32)` selector on LOP v4.
-/// Returns the remaining making amount for partially-fillable orders.
-/// Returns 0 if fully filled/cancelled, `U256::MAX` if never partially filled.
-const REMAINING_SELECTOR: [u8; 4] = [0x10, 0xad, 0x2c, 0x8b];
+/// Returns the remaining making amount for partially-fillable orders: 0 if fully
+/// filled/cancelled, the remaining amount if partially filled. Reverts with
+/// [`REMAINING_FRESH_ERROR`] for orders that were never touched on-chain.
+const REMAINING_SELECTOR: [u8; 4] = [0x43, 0x5b, 0x97, 0x89];
+
+/// `RemainingInvalidatedOrder()` error selector — raised by
+/// `remainingInvalidatorForOrder` when the order has no fill history yet.
+const REMAINING_FRESH_ERROR: &str = "aa3eef95";
+
+/// `bitInvalidatorForOrder(address,uint256)` selector on LOP v4.
+/// Takes the order's `makerTraits` nonce and returns the invalidation bitmap of
+/// the 256-nonce slot containing it. Used for all-or-nothing orders, which the
+/// remaining invalidator does not track.
+const BIT_INVALIDATOR_SELECTOR: [u8; 4] = [0x14, 0x3e, 0x86, 0xa7];
+
+/// Whether the LOP tracks this order's fills with the bit invalidator.
+///
+/// `MakerTraits` bit 255 disallows partial fills; bit 254 allows multiple fills.
+/// The LOP uses the bit invalidator when partial fills or multiple fills are
+/// disallowed, and the remaining invalidator otherwise (`MakerTraitsLib.useBitInvalidator`).
+fn uses_bit_invalidator(maker_traits: U256) -> bool {
+    maker_traits.bit(255) || !maker_traits.bit(254)
+}
+
+/// The 40-bit order nonce stored in `MakerTraits` bits 120..160.
+fn bit_invalidator_nonce(maker_traits: U256) -> U256 {
+    (maker_traits >> 120) & U256::from(0xff_ffff_ffffu64)
+}
 
 // ABI for querying the Fusion Dutch-auction extension via LOP.simulate().
 // All Order address fields are `uint256` to match 1inch's packed `Address` type.
@@ -202,12 +227,16 @@ impl OneinchClient {
         Ok(orders)
     }
 
-    /// Calls `LOP.remainingInvalidatorForOrder(maker, orderHash)` via a raw JSON-RPC
-    /// `eth_call` and returns the remaining making amount that can still be filled.
+    /// Queries the LOP for the making amount of `order` that can still be filled.
     ///
-    /// - Returns `full_making` when the order is fresh (LOP returns `U256::MAX`) or on error.
+    /// Dispatches on the order's `makerTraits` to the invalidation mechanism the LOP
+    /// actually uses for it: the bit invalidator for all-or-nothing orders, the
+    /// remaining invalidator for partial-fillable ones.
+    ///
+    /// - Returns `full_making` when the order is untouched, or on RPC failure
+    ///   (fail-open, logged).
     /// - Returns `0` when the order is fully filled or cancelled.
-    /// - Returns the actual remaining making amount otherwise (clamped to `full_making`).
+    /// - Returns the actual remaining making amount for partial fills (clamped).
     pub(crate) async fn query_remaining_making_amount(&self, order: &FusionOrder) -> U256 {
         let full = order.making_amount;
 
@@ -215,6 +244,25 @@ impl OneinchClient {
             Ok(a) => a,
             Err(_) => return full,
         };
+
+        match U256::from_str(&order.maker_traits) {
+            Ok(traits) if uses_bit_invalidator(traits) => {
+                self.query_bit_invalidator(order, maker, traits).await
+            }
+            Ok(_) => self.query_remaining_invalidator(order, maker).await,
+            Err(e) => {
+                tracing::warn!(order_id = %order.order_id, error = %e,
+                    "unparsable makerTraits; falling back to remaining invalidator");
+                self.query_remaining_invalidator(order, maker).await
+            }
+        }
+    }
+
+    /// Calls `LOP.remainingInvalidatorForOrder(maker, orderHash)` for partial-fillable
+    /// orders. The LOP reverts `RemainingInvalidatedOrder()` for orders it has never
+    /// seen — treated as the full amount.
+    async fn query_remaining_invalidator(&self, order: &FusionOrder, maker: AlloyAddress) -> U256 {
+        let full = order.making_amount;
 
         let hash_str = order.order_id.strip_prefix("0x").unwrap_or(&order.order_id);
         let hash_bytes = match hex::decode(hash_str) {
@@ -230,8 +278,65 @@ impl OneinchClient {
         calldata.extend_from_slice(maker.as_slice());
         calldata.extend_from_slice(&hash_bytes);
 
+        let raw = match self.lop_eth_call(&calldata).await {
+            Ok(raw) => raw,
+            Err(err) => {
+                if err.contains(REMAINING_FRESH_ERROR) {
+                    return full; // RemainingInvalidatedOrder(): order never touched on-chain
+                }
+                tracing::warn!(order_id = %order.order_id, error = %err,
+                    "remaining-amount query failed; assuming full order");
+                return full;
+            }
+        };
+
+        U256::from_be_slice(&raw).min(full)
+    }
+
+    /// Calls `LOP.bitInvalidatorForOrder(maker, nonce)` for all-or-nothing orders.
+    ///
+    /// Despite the ABI parameter being named `slot`, the LOP takes the raw 40-bit
+    /// `makerTraits` nonce and returns the 256-bit invalidation bitmap of the slot
+    /// containing it (verified against mainnet fills). The order is dead once bit
+    /// `nonce & 0xff` is set.
+    async fn query_bit_invalidator(
+        &self,
+        order: &FusionOrder,
+        maker: AlloyAddress,
+        traits: U256,
+    ) -> U256 {
+        let full = order.making_amount;
+        let nonce = bit_invalidator_nonce(traits);
+
+        // ABI-encode: bitInvalidatorForOrder(address maker, uint256 nonce)
+        let mut calldata = Vec::with_capacity(68);
+        calldata.extend_from_slice(&BIT_INVALIDATOR_SELECTOR);
+        calldata.extend_from_slice(&[0u8; 12]); // address left-padded to 32 bytes
+        calldata.extend_from_slice(maker.as_slice());
+        calldata.extend_from_slice(&nonce.to_be_bytes::<32>());
+
+        let raw = match self.lop_eth_call(&calldata).await {
+            Ok(raw) => raw,
+            Err(err) => {
+                tracing::warn!(order_id = %order.order_id, error = %err,
+                    "bit-invalidator query failed; assuming full order");
+                return full;
+            }
+        };
+
+        let bitmap = U256::from_be_slice(&raw);
+        if bitmap.bit(usize::from(nonce.byte(0))) {
+            U256::ZERO // nonce bit invalidated: order filled or cancelled
+        } else {
+            full
+        }
+    }
+
+    /// Raw `eth_call` to the LOP at `latest`, returning the last 32 bytes of the
+    /// call's return data, or the RPC/revert error text on failure.
+    async fn lop_eth_call(&self, calldata: &[u8]) -> Result<Vec<u8>, String> {
         let lop_hex = format!("0x{}", hex::encode(LOP_V4.as_slice()));
-        let data_hex = format!("0x{}", hex::encode(&calldata));
+        let data_hex = format!("0x{}", hex::encode(calldata));
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "eth_call",
@@ -239,32 +344,28 @@ impl OneinchClient {
             "id": 1
         });
 
-        let Ok(resp) = self.rpc_client.post(&self.rpc_url).json(&body).send().await else {
-            return full;
-        };
+        let resp = self
+            .rpc_client
+            .post(&self.rpc_url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("RPC request failed: {e}"))?;
 
-        let json: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(_) => return full,
-        };
+        let json: serde_json::Value =
+            resp.json().await.map_err(|e| format!("RPC response unreadable: {e}"))?;
 
-        let hex_result = match json["result"].as_str() {
-            Some(s) => s.strip_prefix("0x").unwrap_or(s),
-            None => return full,
+        let Some(hex_result) = json["result"].as_str() else {
+            return Err(json["error"].to_string());
         };
+        let hex_result = hex_result.strip_prefix("0x").unwrap_or(hex_result);
 
         if hex_result.len() < 64 {
-            return full;
+            return Err(format!("short return data: {hex_result:?}"));
         }
 
-        let Ok(raw) = hex::decode(&hex_result[hex_result.len() - 64..]) else { return full };
-
-        let val = U256::from_be_slice(&raw);
-        if val == U256::MAX {
-            full // fresh order: never partially filled
-        } else {
-            val.min(full)
-        }
+        hex::decode(&hex_result[hex_result.len() - 64..])
+            .map_err(|e| format!("undecodable return data: {e}"))
     }
 
     /// Static-calls `extension.getTakingAmount(...)` to get the exact on-chain auction price.
@@ -632,6 +733,36 @@ fn parse_iso_timestamp(s: &str) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remaining_selector_matches_lop_abi() {
+        let hash = alloy::primitives::keccak256(b"remainingInvalidatorForOrder(address,bytes32)");
+        assert_eq!(REMAINING_SELECTOR, hash[..4]);
+        let err = alloy::primitives::keccak256(b"RemainingInvalidatedOrder()");
+        assert_eq!(REMAINING_FRESH_ERROR, hex::encode(&err[..4]));
+        let bit = alloy::primitives::keccak256(b"bitInvalidatorForOrder(address,uint256)");
+        assert_eq!(BIT_INVALIDATOR_SELECTOR, bit[..4]);
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test constants")]
+    fn maker_traits_invalidator_dispatch() {
+        // All-or-nothing Fusion order seen live (bit255 set, bit254 clear):
+        // filled at block 25591051, bit 85 of slot 368875248 set on mainnet.
+        let aon =
+            U256::from_str("0x8a000000000000000000000015fc96f055006a613e6000000000000000000000")
+                .unwrap();
+        assert!(uses_bit_invalidator(aon));
+        assert_eq!(bit_invalidator_nonce(aon), U256::from(94_432_063_573u64));
+        assert_eq!(bit_invalidator_nonce(aon).byte(0), 85);
+
+        // Partial-fillable whale order 0xf89e7b1e (bit254 set, bit255 clear):
+        // tracked by the remaining invalidator on mainnet.
+        let partial =
+            U256::from_str("0x4a80000000000000000000000000000000006a60987a00000000000000000000")
+                .unwrap();
+        assert!(!uses_bit_invalidator(partial));
+    }
 
     #[test]
     #[expect(clippy::expect_used, reason = "test assertion helper")]
