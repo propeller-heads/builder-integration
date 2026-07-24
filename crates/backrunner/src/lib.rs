@@ -66,6 +66,24 @@ fn weth_hex_for_chain(chain: &str) -> Option<&'static str> {
     }
 }
 
+/// Priority fee attached to settlement transactions (0.1 gwei).
+const PRIORITY_FEE_WEI: u128 = 100_000_000;
+
+/// Gas a settlement spends outside the Fynd-quoted swap routes: LOP `fillOrderArgs`
+/// (signature check, invalidator update, maker↔taker transfers), resolver dispatch,
+/// and surplus unwrap/handling.
+///
+/// Calibrated against `eth_estimateGas` of recorded executable candidates (400k–494k
+/// total). The per-candidate decomposition (route/surplus/overhead) is logged on
+/// every build for recalibration.
+const SETTLE_OVERHEAD_GAS: u64 = 220_000;
+
+/// Headroom applied on top of [`expected_gas`](BackrunTx::expected_gas) for the
+/// transaction gas limit: cold-slot and state-drift slack (50%).
+fn gas_limit_with_headroom(expected_gas: u64) -> u64 {
+    expected_gas.saturating_add(expected_gas / 2)
+}
+
 /// Configuration for a [`Backrunner`] instance.
 #[derive(Debug, Clone)]
 pub struct BackrunnerConfig {
@@ -633,7 +651,7 @@ async fn build_backrun_tx(
     fill_amount: U256,
 ) -> Option<BackrunTx> {
     let BackrunContext { uuid, block_ts, base_fee, backrunner, .. } = ctx;
-    let fynd_tx = order_quote.transaction()?;
+    order_quote.transaction()?; // no encoded settlement transaction — nothing to build
 
     // Exact on-chain taking amount estimate:
     //   rateBump = max(0, auctionBump − gasBump)      ← gas subtracts from rate
@@ -732,23 +750,26 @@ async fn build_backrun_tx(
         None => {}
     }
 
-    assemble_backrun_tx(ctx, fusion_order, fynd_tx, fill_amount, amount_out, taking_amount).await
+    assemble_backrun_tx(ctx, fusion_order, order_quote, fill_amount, amount_out, taking_amount)
+        .await
 }
 
 /// Builds the settlement transaction once profitability is confirmed.
 ///
 /// Fetches a surplus→WETH quote, encodes the LOP fill calldata, and wraps everything
-/// in a [`BackrunTx`].
+/// in a [`BackrunTx`]. Returns `None` when the WETH surplus does not cover the
+/// expected gas cost.
 async fn assemble_backrun_tx(
     ctx: &BackrunContext<'_>,
     fusion_order: &FusionOrder,
-    fynd_tx: &fynd_core::Transaction,
+    order_quote: &OrderQuote,
     fill_amount: U256,
     amount_out: U256,
     taking_estimate: U256,
 ) -> Option<BackrunTx> {
     let BackrunContext { uuid, base_fee, block_number, solve_time_ms, orders_quoted, backrunner, state_label, .. } =
         ctx;
+    let fynd_tx = order_quote.transaction()?;
 
     let surplus_amount = amount_out.saturating_sub(taking_estimate);
     let taker_is_weth = fusion_order.to_token.eq_ignore_ascii_case(backrunner.weth_hex);
@@ -808,33 +829,56 @@ async fn assemble_backrun_tx(
     };
     let settle_data = build_settle_calldata(&params);
 
+    // Expected execution gas: Fynd's estimates for the quoted routes plus the fixed
+    // settlement overhead (LOP fill, resolver dispatch, surplus handling).
+    let route_gas = biguint_to_u256(order_quote.gas_estimate()).saturating_to::<u64>();
+    let surplus_gas = surplus_quote
+        .as_ref()
+        .map_or(0, |q| biguint_to_u256(q.gas_estimate()).saturating_to::<u64>());
+    let expected_gas = route_gas.saturating_add(surplus_gas).saturating_add(SETTLE_OVERHEAD_GAS);
+
     let raw_tx = RawTx {
         to: Some(backrunner.resolver_address),
         value: U256::ZERO,
         data: settle_data,
-        gas_limit: 500_000,
+        gas_limit: gas_limit_with_headroom(expected_gas),
         max_fee_per_gas: u128::from(*base_fee) * 2 + 1_000_000_000,
-        max_priority_fee_per_gas: 100_000_000,
+        max_priority_fee_per_gas: PRIORITY_FEE_WEI,
     };
 
     // Profit is always WETH-denominated (ETH wei): the surplus is already WETH when the
     // taker asset is WETH, otherwise it is the WETH output of the surplus→WETH swap. This
     // keeps expected_profit_wei comparable across orders with different taker assets.
-    let profit_weth = if taker_is_weth {
+    let gross_profit_weth = if taker_is_weth {
         surplus_amount
     } else {
         surplus_quote.as_ref().map_or(U256::ZERO, |q| biguint_to_u256(q.amount_out()))
     };
+
+    let gas_cost =
+        U256::from(u128::from(*base_fee) + PRIORITY_FEE_WEI).saturating_mul(U256::from(expected_gas));
+    if gross_profit_weth <= gas_cost {
+        debug!(%uuid, order_id = %fusion_order.order_id,
+            gross_profit_weth = %gross_profit_weth,
+            gas_cost = %gas_cost,
+            expected_gas, route_gas, surplus_gas,
+            "surplus does not cover gas cost, skipping");
+        return None;
+    }
+    let profit_weth = gross_profit_weth - gas_cost;
     let expected_profit = I256::try_from(profit_weth).unwrap_or(I256::MAX);
 
     debug!(%uuid, block_number, solve_time_ms, orders_quoted,
         amount_out = %amount_out,
         taking_estimate = %taking_estimate,
         surplus = %surplus_amount,
+        route_gas, surplus_gas, expected_gas,
+        gas_cost = %gas_cost,
+        gross_profit_weth = %gross_profit_weth,
         profit_weth = %profit_weth,
         "backrun candidate built");
 
-    Some(BackrunTx { tx: raw_tx, expected_profit_wei: expected_profit, expected_gas: 300_000 })
+    Some(BackrunTx { tx: raw_tx, expected_profit_wei: expected_profit, expected_gas })
 }
 
 /// Quotes a surplus→WETH swap via Fynd using the same pending state label as the main quote.

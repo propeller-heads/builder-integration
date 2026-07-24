@@ -63,12 +63,17 @@ pub struct BackrunCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackrunTx {
     pub tx: RawTx,
-    /// Expected surplus captured by the resolver, denominated in WETH (ETH wei).
+    /// Expected profit net of gas, denominated in WETH (ETH wei).
     ///
-    /// When the order's taker asset is WETH this is the raw surplus; otherwise it is
-    /// the WETH output of the surplus→WETH swap, so the value is comparable across
-    /// orders regardless of taker asset.
+    /// The gross surplus captured by the resolver (raw when the order's taker asset is
+    /// WETH, otherwise the WETH output of the surplus→WETH swap) minus the expected gas
+    /// cost (`expected_gas × (base_fee + priority_fee)`), so the value is comparable
+    /// across orders regardless of taker asset. Candidates whose surplus does not cover
+    /// gas are never published.
     pub expected_profit_wei: I256,
+    /// Estimated execution gas: Fynd's route estimates (primary fill + surplus swap)
+    /// plus the fixed settlement overhead (LOP fill, resolver dispatch, surplus
+    /// handling). The transaction's `gas_limit` carries 50% headroom on top.
     pub expected_gas: u64,
 }
 
