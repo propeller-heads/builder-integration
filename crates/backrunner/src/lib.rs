@@ -28,7 +28,7 @@ mod encode_test;
 
 pub use order::{AuctionPoint, FusionOrder};
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, sync::Arc, time::Duration};
 
 use alloy::primitives::{utils::format_ether, Address as AlloyAddress, I256, U256};
 
@@ -142,6 +142,7 @@ enum EvaluateError {
     Solve(#[from] SolveError),
 }
 
+#[derive(Clone)]
 struct PendingIteration {
     block: BlockEnv,
     txs: Vec<ExecutedTx>,
@@ -176,6 +177,9 @@ pub struct Backrunner {
     verify_onchain_taking: bool,
     /// WETH address (0x-hex) for the configured chain; profit denomination + surplus swaps.
     weth_hex: &'static str,
+    /// Receives orders newly observed by the orderbook poller (poll diff), consumed once
+    /// by [`run`](Self::run) to solve on order arrival instead of waiting for a block.
+    new_orders_rx: tokio::sync::Mutex<Option<mpsc::Receiver<Vec<FusionOrder>>>>,
 }
 
 impl Backrunner {
@@ -223,10 +227,12 @@ impl Backrunner {
         // Seed the watch channel with an empty orderbook; the background task
         // will populate it on the first poll.
         let (orders_tx, orders_rx) = watch::channel(Arc::new(Vec::new()));
+        let (new_orders_tx, new_orders_rx) = mpsc::channel(16);
         let market_data_for_orders = solver.market_data();
         tokio::spawn(run_orderbook(
             Arc::clone(&oneinch),
             orders_tx,
+            new_orders_tx,
             market_data_for_orders,
             config.orderbook_interval,
         ));
@@ -240,6 +246,7 @@ impl Backrunner {
             oneinch,
             verify_onchain_taking: config.verify_onchain_taking,
             weth_hex,
+            new_orders_rx: tokio::sync::Mutex::new(Some(new_orders_rx)),
         })
     }
 
@@ -279,12 +286,72 @@ impl Backrunner {
     ) {
         tracing::info!("backrunner started");
         let mut pending: HashMap<Uuid, PendingIteration> = HashMap::new();
+        let mut new_orders = self.new_orders_rx.lock().await.take();
+        // Most recent completed iteration: the block context order arrivals are solved
+        // against until the next block event lands.
+        let mut last_iter: Option<PendingIteration> = None;
 
-        while let Some(event) = events.recv().await {
-            self.handle_event(&mut pending, &candidates, event).await;
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else { break };
+                    if let BuildEvent::IterationComplete { uuid, .. } = &event {
+                        if let Some(iter) = pending.get(uuid) {
+                            last_iter = Some(iter.clone());
+                        }
+                    }
+                    self.handle_event(&mut pending, &candidates, event).await;
+                }
+                fresh = async {
+                    match new_orders.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let Some(fresh) = fresh else {
+                        new_orders = None;
+                        continue;
+                    };
+                    self.solve_order_arrivals(last_iter.as_ref(), &candidates, fresh).await;
+                }
+            }
         }
 
         tracing::info!("event channel closed, backrunner shutting down");
+    }
+
+    /// Solves newly observed orders against the last completed block context.
+    ///
+    /// Orders are distributed ahead of their auction start and mostly filled at or before
+    /// it; waiting for the next block event costs up to a block of reaction time. Solving
+    /// on arrival closes that gap. Only publishes when a candidate is found, so a fresh
+    /// block candidate is never cleared by a quiet arrival.
+    async fn solve_order_arrivals(
+        &self,
+        last_iter: Option<&PendingIteration>,
+        candidates: &watch::Sender<Option<BackrunCandidate>>,
+        fresh: Vec<FusionOrder>,
+    ) {
+        let Some(iter) = last_iter else {
+            debug!(arrivals = fresh.len(), "orders arrived before first block; deferring to block eval");
+            return;
+        };
+        let uuid = Uuid::new_v4();
+        let block_number = iter.block.block_number;
+        let outcome = self.evaluate_orders(uuid, iter.clone(), &fresh).await;
+        let opportunities = outcome.candidate.as_ref().map_or(0, |c| c.txs.len());
+        info!(
+            block = block_number,
+            arrivals = fresh.len(),
+            opportunities,
+            solve_ms = outcome.solve_time_ms.unwrap_or(0),
+            "order arrivals evaluated",
+        );
+        if outcome.candidate.is_some() {
+            if let Err(e) = candidates.send(outcome.candidate) {
+                error!(error = %e, "candidate watch channel has no receivers");
+            }
+        }
     }
 
     async fn handle_event(
@@ -565,11 +632,15 @@ fn log_iteration_summary(block_number: u64, tx_count: usize, outcome: &EvalOutco
 async fn run_orderbook(
     client: Arc<OneinchClient>,
     orders_tx: watch::Sender<Arc<Vec<FusionOrder>>>,
+    new_orders_tx: mpsc::Sender<Vec<FusionOrder>>,
     market_data: MarketData,
     interval: Duration,
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Order ids seen on the previous poll; None until the first successful fetch so the
+    // initial snapshot is not misreported as a burst of arrivals.
+    let mut known_ids: Option<HashSet<String>> = None;
 
     loop {
         ticker.tick().await;
@@ -589,6 +660,24 @@ async fn run_orderbook(
                     .max()
                     .unwrap_or(U256::ZERO);
                 info!(live_orders = filtered.len(), max_init_bump_bps = %max_bump, "orderbook refreshed");
+
+                // Synthesize order-arrival events from the poll diff: anything not seen on
+                // the previous fetch is new and gets solved immediately, without waiting
+                // for the next block event.
+                let current_ids: HashSet<String> =
+                    filtered.iter().map(|o| o.order_id.clone()).collect();
+                if let Some(known) = &known_ids {
+                    let fresh: Vec<FusionOrder> = filtered
+                        .iter()
+                        .filter(|o| !known.contains(&o.order_id))
+                        .cloned()
+                        .collect();
+                    if !fresh.is_empty() && new_orders_tx.try_send(fresh).is_err() {
+                        debug!("new-order channel full or closed; arrivals fold into next block eval");
+                    }
+                }
+                known_ids = Some(current_ids);
+
                 if orders_tx.send(Arc::new(filtered)).is_err() {
                     break;
                 }
