@@ -111,7 +111,9 @@ pub struct BackrunnerConfig {
     /// How often to refresh the 1inch Fusion orderbook.
     ///
     /// Shorter intervals are more reactive to new orders but increase API load.
-    /// Default: 12 seconds (one Ethereum block).
+    /// Recommended: 3 seconds — orders are distributed ahead of their auction start and
+    /// most fills land at or before it, so discovery latency compounds directly into
+    /// missed candidates. 12s polling adds up to a full block of blindness.
     pub orderbook_interval: Duration,
     /// When `true`, issues a static `eth_call` to verify the exact on-chain taking amount
     /// before submitting a fill. Adds one RPC round-trip per profitable order candidate.

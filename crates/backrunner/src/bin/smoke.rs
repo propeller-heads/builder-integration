@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
         chain_id,
         resolver_address: resolver_addr,
         slippage: 0.005,
-        orderbook_interval: Duration::from_secs(12),
+        orderbook_interval: Duration::from_secs(3),
         verify_onchain_taking: false,
     };
 

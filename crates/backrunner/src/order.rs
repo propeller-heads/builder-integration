@@ -193,20 +193,24 @@ pub fn compute_gas_bump(order: &FusionOrder, base_fee_wei: u64) -> u128 {
 
 /// Returns the minimum required output amount A(t) at `unix_ts`.
 ///
-/// Returns `Some` when `unix_ts` is within the half-open window
-/// `[auction_start_time, auction_start_time + auction_duration_secs)`.
-/// Returns `None` when the order has expired or not yet started.
+/// Returns `Some` for any `unix_ts` before `auction_start_time + auction_duration_secs`;
+/// before `auction_start_time` the amount is pinned to the start amount. Returns `None`
+/// once the auction has expired.
 pub fn amount_at_timestamp(order: &FusionOrder, unix_ts: u64) -> Option<U256> {
     let elapsed = elapsed_secs(order, unix_ts)?;
     let (t0, a0, t1, a1) = find_segment(order, elapsed);
     Some(interpolate(t0, a0, t1, a1, elapsed))
 }
 
+/// Seconds into the auction at `unix_ts`, or `None` once the auction has expired.
+///
+/// Timestamps before `auction_start_time` clamp to 0: the on-chain `_getAuctionBump`
+/// returns the full `initialRateBump` before the start time, so orders are fillable
+/// pre-start at the maximum (start) price. Measured on mainnet, the median Fusion fill
+/// lands ~13s BEFORE auction start — treating pre-start orders as inactive would hide
+/// the window where most fills actually happen.
 fn elapsed_secs(order: &FusionOrder, unix_ts: u64) -> Option<u64> {
-    if unix_ts < order.auction_start_time {
-        return None;
-    }
-    let elapsed = unix_ts - order.auction_start_time;
+    let elapsed = unix_ts.saturating_sub(order.auction_start_time);
     if elapsed >= order.auction_duration_secs {
         return None;
     }
@@ -273,8 +277,11 @@ mod tests {
     }
 
     #[test]
-    fn before_start_returns_none() {
-        assert_eq!(amount_at_timestamp(&simple_order(), 999), None);
+    fn before_start_returns_start_amount() {
+        // Pre-start clamps to elapsed = 0: the on-chain auction prices the order at the
+        // full initial rate bump before start, so it is quotable (at the start amount).
+        assert_eq!(amount_at_timestamp(&simple_order(), 999), Some(U256::from(1_000u64)));
+        assert_eq!(amount_at_timestamp(&simple_order(), 0), Some(U256::from(1_000u64)));
     }
 
     #[test]
@@ -391,11 +398,16 @@ mod tests {
     }
 
     #[test]
-    fn faba_before_auction_start_returns_none() {
+    fn faba_before_auction_start_pinned_to_start_amount() {
         // confirmed block 25230552 had timestamp=1780413599, which is 9s BEFORE startTime.
-        // This replicates what the on-chain eth_call at "latest" would see — the auction
-        // hasn't started, so the extension should be called with timestamp override instead.
-        assert_eq!(amount_at_timestamp(&faba_order(), 1_780_413_599), None);
+        // On-chain the extension prices pre-start fills at the full initial rate bump,
+        // so the estimate must pin to the start-time value instead of dropping the order.
+        let order = faba_order();
+        assert_eq!(
+            amount_at_timestamp(&order, 1_780_413_599),
+            amount_at_timestamp(&order, order.auction_start_time),
+        );
+        assert!(amount_at_timestamp(&order, 1_780_413_599).is_some());
     }
 
     #[test]
@@ -654,9 +666,13 @@ mod tests {
     }
 
     #[test]
-    fn uni_before_start_returns_none() {
-        // 1s before auction start
-        assert_eq!(amount_at_timestamp(&uni_order_no_pts(), 1_780_417_844), None);
+    fn uni_before_start_pinned_to_start_amount() {
+        // 1s before auction start: pinned to the start-time value (fillable pre-start).
+        let order = uni_order_no_pts();
+        assert_eq!(
+            amount_at_timestamp(&order, 1_780_417_844),
+            amount_at_timestamp(&order, order.auction_start_time),
+        );
     }
 
     #[test]
@@ -689,8 +705,12 @@ mod tests {
     }
 
     #[test]
-    fn dca_before_start_returns_none() {
-        assert_eq!(onchain_taking_amount(&dca_order(), 1_780_417_051, 2_310_734_453), None);
+    fn dca_before_start_pinned_to_start_price() {
+        let order = dca_order();
+        let pre = onchain_taking_amount(&order, 1_780_417_051, 2_310_734_453);
+        let at_start = onchain_taking_amount(&order, order.auction_start_time, 2_310_734_453);
+        assert_eq!(pre, at_start);
+        assert!(pre.is_some());
     }
 
     #[test]
